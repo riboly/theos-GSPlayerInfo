@@ -832,6 +832,7 @@ static void GSPushToNAS(void) {
 
 @interface GSPlayerInfoTapTarget : NSObject <UIGestureRecognizerDelegate>
 + (instancetype)shared;
+- (void)onFab;
 - (void)onTick;
 - (void)onClosePanel;
 - (void)onCopyTitle;
@@ -1011,10 +1012,17 @@ static void GSEnsureFab(void) {
         gBtn.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.35].CGColor;
         gBtn.layer.borderWidth = 0.5;
         gBtn.clipsToBounds = YES;
+        // 点击开面板
+        [gBtn addTarget:[GSPlayerInfoTapTarget shared]
+                      action:@selector(onFab)
+            forControlEvents:UIControlEventTouchUpInside];
+        // 拖动改位置（不拦截轻点：cancelsTouchesInView=NO）
         UIPanGestureRecognizer *pan =
             [[UIPanGestureRecognizer alloc] initWithTarget:[GSPlayerInfoTapTarget shared]
                                                     action:@selector(onPan:)];
         pan.delegate = [GSPlayerInfoTapTarget shared];
+        pan.cancelsTouchesInView = NO;
+        pan.maximumNumberOfTouches = 1;
         [gBtn addGestureRecognizer:pan];
         [win addSubview:gBtn];
     } else if (gBtn.superview != win) {
@@ -1042,19 +1050,31 @@ static void GSEnsureFab(void) {
         gFabMoved = NO;
     } else if (pan.state == UIGestureRecognizerStateChanged) {
         CGPoint t = [pan translationInView:win];
-        if (fabs(t.x) + fabs(t.y) > 3) gFabMoved = YES;
+        if (fabs(t.x) + fabs(t.y) > 4) gFabMoved = YES;
+        if (!gFabMoved) return; // 未超过阈值，当点击
         gFabOffset = CGPointMake(gFabOffset.x + t.x, gFabOffset.y + t.y);
         [pan setTranslation:CGPointZero inView:win];
         GSLayoutFab();
     } else if (pan.state == UIGestureRecognizerStateEnded ||
                pan.state == UIGestureRecognizerStateCancelled) {
-        if (!gFabMoved) {
-            if (gPanel && !gPanel.hidden)
-                GSHidePanel();
-            else
-                GSShowPanel();
+        // 拖动结束后短暂锁点击，避免松手再弹一次
+        if (gFabMoved) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ gFabMoved = NO; });
+        } else {
+            gFabMoved = NO;
         }
-        gFabMoved = NO;
+    }
+}
+- (void)onFab {
+    if (gFabMoved) return; // 刚拖过，不弹
+    @try {
+        if (gPanel && !gPanel.hidden)
+            GSHidePanel();
+        else
+            GSShowPanel();
+    } @catch (__unused NSException *e) {
+        GSToast(@"面板打开异常");
     }
 }
 - (void)onClosePanel {
