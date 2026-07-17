@@ -837,8 +837,13 @@ static id h_asset_initURL(id s, SEL c, id url, id o) {
 static id h_asset_withURL(id s, SEL c, id url, id o) {
     if ([url isKindOfClass:[NSURL class]]) {
         NSString *us = [(NSURL *)url absoluteString];
-
-
+        GSRememberURL(us, @"AVURLAsset");
+        if (!gInOurNetwork) GSFetchM3U8(us);
+    }
+    id r = ((id(*)(id, SEL, id, id))o_asset_withURL)(s, c, url, o);
+    if ([r isKindOfClass:[AVAsset class]]) GSLoadAVMeta(r);
+    return r;
+}
 
 static id h_sess_req(id s, SEL c, id req) {
     if (!gInOurNetwork && [req isKindOfClass:[NSURLRequest class]]) {
