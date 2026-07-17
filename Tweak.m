@@ -53,10 +53,29 @@ static NSTimeInterval gLastOCR = 0;
 static NSTimeInterval gLastMeta = 0;
 static NSTimeInterval gLastM3U8Fetch = 0;
 static NSString *gLastM3U8URL = @"";
+static NSString *gOCRBoundURL = @""; // 当前 OCR 结果对应的播放 URL
+static NSUInteger gPlayGen = 0;     // 换片代数，丢弃过期异步 OCR
 static CGPoint gFabOffset = {0, 0};
 static BOOL gFabMoved = NO;
 static volatile BOOL gInOurNetwork = NO; // 防止我们自己的请求再进 hook 逻辑
 static BOOL gDesHooked = NO;
+
+// 换片：清空各源标题，避免 OCR/A11y 等残留上一条
+static void GSResetTitlesForNewMedia(void) {
+    gTitleJSON = @"";
+    gTitleAVMeta = @"";
+    gTitleM3U8 = @"";
+    gTitleA11y = @"";
+    gTitleOCR = @"";
+    gTitleDES = @"";
+    gTitleBest = @"";
+    gOCRBoundURL = @"";
+    gLastOCR = 0;
+    gLastMeta = 0;
+    gLastM3U8Fetch = 0;
+    gLastM3U8URL = @"";
+    gPlayGen++;
+}
 
 #pragma mark - String helpers
 
@@ -231,6 +250,10 @@ static void GSRememberURL(NSString *u, NSString *source) {
         !([source hasPrefix:@"AV"] || [source hasPrefix:@"IJK"] || [source hasPrefix:@"FVP"]))
         return;
     if (GSIsNoiseHost(u)) return;
+    // 播放地址变了 = 新视频，清掉旧标题（含 OCR）
+    if (u.length && gURL.length && ![gURL isEqualToString:u]) {
+        GSResetTitlesForNewMedia();
+    }
     gURL = [u copy];
     if (source.length) gExtra = [source copy];
 }
@@ -511,10 +534,23 @@ static void GSScanA11yTitle(void) {
     }
 }
 
-static void GSOcrTopTitle(void) {
-    if (GSLooksLikeTitle(gTitleBest) && gTitleBest.length >= 4) return;
+// force=YES：打开面板/复制时强制重识别；force=NO：仅当前片尚无 OCR 时补一次
+static void GSOcrTopTitle(BOOL force) {
     NSTimeInterval now = CFAbsoluteTimeGetCurrent();
-    if (now - gLastOCR < 2.5) return;
+    if (!force) {
+        // 本片已有 OCR 结果则跳过（换片会清 gTitleOCR / gOCRBoundURL）
+        if (gTitleOCR.length &&
+            (!gURL.length || !gOCRBoundURL.length || [gOCRBoundURL isEqualToString:gURL]))
+            return;
+        if (now - gLastOCR < 2.5) return;
+    } else {
+        // 强制也限流，避免连点 FAB 打爆 Vision
+        if (now - gLastOCR < 0.7) return;
+        // 先清空 OCR 槽，避免面板继续显示上一条/旧识别
+        gTitleOCR = @"";
+        gOCRBoundURL = @"";
+        GSRecomputeBestTitle();
+    }
     gLastOCR = now;
     UIWindow *win = GSKeyWindow();
     if (!win) return;
@@ -529,10 +565,14 @@ static void GSOcrTopTitle(void) {
         return;
     }
     CGContextTranslateCTM(ctx, -band.origin.x, -band.origin.y);
-    [win drawViewHierarchyInRect:win.bounds afterScreenUpdates:NO];
+    // afterScreenUpdates:YES 尽量抓到当前片标题栏
+    [win drawViewHierarchyInRect:win.bounds afterScreenUpdates:YES];
     UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
     UIGraphicsEndImageContext();
     if (!img.CGImage) return;
+
+    const NSUInteger gen = gPlayGen;
+    NSString *boundURL = [gURL copy] ?: @"";
 
     VNImageRequestHandler *handler =
         [[VNImageRequestHandler alloc] initWithCGImage:img.CGImage options:@{}];
@@ -548,12 +588,15 @@ static void GSOcrTopTitle(void) {
               if (GSLooksLikeTitle(s) && (!best || s.length > best.length)) best = s;
           }
           if ((!best || best.length < 4) && GSLooksLikeTitle(join)) best = join;
-          if (best.length) {
-              dispatch_async(dispatch_get_main_queue(), ^{
-                GSSetTitle(best, @"OCR");
-                GSRefreshPanelLabels();
-              });
-          }
+          if (!best.length) return;
+          dispatch_async(dispatch_get_main_queue(), ^{
+            // 换片后丢弃过期 OCR 结果
+            if (gen != gPlayGen) return;
+            if (boundURL.length && gURL.length && ![boundURL isEqualToString:gURL]) return;
+            GSSetTitle(best, @"OCR");
+            gOCRBoundURL = boundURL.length ? [boundURL copy] : [gURL copy];
+            GSRefreshPanelLabels();
+          });
         }];
     req.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
     req.usesLanguageCorrection = NO;
@@ -1046,7 +1089,8 @@ static void GSShowPanel(void) {
         if (gLastAV) GSSampleAV(gLastAV);
         if (gLastIJK) GSSampleIJK(gLastIJK);
         if (gURL.length && !gInOurNetwork) GSFetchM3U8TitleIfNeeded(gURL);
-        if (!GSLooksLikeTitle(gTitleBest)) GSOcrTopTitle();
+        // 每次开面板强制 OCR，避免一直显示上一条
+        GSOcrTopTitle(YES);
     } @catch (__unused NSException *e) {
     }
 
@@ -1268,7 +1312,7 @@ static void GSEnsureFab(void) {
 }
 - (void)onCopyTitle {
     GSScanA11yTitle();
-    if (!GSLooksLikeTitle(GSEffectiveTitle())) GSOcrTopTitle();
+    GSOcrTopTitle(YES);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
                      NSString *t = GSEffectiveTitle();
@@ -1312,7 +1356,8 @@ static void GSEnsureFab(void) {
         if (gLastIJK) GSSampleIJK(gLastIJK);
         if (gURL.length || gLastAV || gLastIJK) {
             GSScanA11yTitle();
-            if (!GSLooksLikeTitle(GSEffectiveTitle())) GSOcrTopTitle();
+            // 后台仅在本片尚无 OCR 时补识别（换片后会清空）
+            GSOcrTopTitle(NO);
             if (gURL.length && !gInOurNetwork) GSFetchM3U8TitleIfNeeded(gURL);
         }
         // 清掉错误技术串
