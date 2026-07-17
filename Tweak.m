@@ -1,9 +1,11 @@
 /*
- * GSPlayerInfo
- * - 标题多源：JSON(display_title 等, 强制中日文) / AVAsset元数据 / m3u8 / 无障碍 / OCR
- * - 过滤 snake_case 技术串（如 hierarchical_inner_product_0）
- * - 灰白半透明可拖动悬浮钮；面板 + NAS 推送
- * - 底部调试条：各方法拿到的标题
+ * GSPlayerInfo — 稳定版
+ * - 去掉危险的 NSURLSession completion 包装（进播放器闪退主因）
+ * - m3u8 抓取带 re-entry 保护
+ * - 标题：JSON(仅可信键+中日文) / AVMeta / m3u8 / A11y / OCR
+ * - 过滤 snake_case 技术串
+ * - 可拖动灰白小悬浮钮；面板内底部调试区
+ * - 无启动弹框、无屏幕底栏
  */
 
 #import <UIKit/UIKit.h>
@@ -21,7 +23,6 @@ static NSString *gExtra = @"";
 static NSInteger gW = 0, gH = 0;
 static BOOL gHooksOK = NO;
 
-// 各方法标题（调试用）
 static NSString *gTitleJSON = @"";
 static NSString *gTitleAVMeta = @"";
 static NSString *gTitleM3U8 = @"";
@@ -31,22 +32,21 @@ static NSString *gTitleBest = @"";
 
 static UIButton *gBtn = nil;
 static UIView *gPanel = nil;
-static UILabel *gLabRes = nil, *gLabTitle = nil, *gLabURL = nil;
-static UILabel *gDebugBar = nil;
+static UILabel *gLabRes = nil, *gLabTitle = nil, *gLabURL = nil, *gLabDebug = nil;
 static UIButton *gBtnNas = nil;
 static id gLastIJK = nil;
 static AVPlayer *gLastAV = nil;
-static AVAsset *gLastAsset = nil;
-static NSMutableArray<NSString *> *gURLHistory;
 static NSTimeInterval gLastOCR = 0;
-static NSTimeInterval gLastMetaLoad = 0;
-static CGPoint gFabOffset = {0, 0}; // 相对默认位置的拖动偏移
-static BOOL gFabMovedThisGesture = NO;
+static NSTimeInterval gLastMeta = 0;
+static NSTimeInterval gLastM3U8Fetch = 0;
+static NSString *gLastM3U8URL = @"";
+static CGPoint gFabOffset = {0, 0};
+static BOOL gFabMoved = NO;
+static volatile BOOL gInOurNetwork = NO; // 防止我们自己的请求再进 hook 逻辑
 
-#pragma mark - String utils
+#pragma mark - String helpers
 
 static BOOL GSHasCJK(NSString *s) {
-    if (s.length == 0) return NO;
     for (NSUInteger i = 0; i < s.length; i++) {
         unichar c = [s characterAtIndex:i];
         if ((c >= 0x4E00 && c <= 0x9FFF) || (c >= 0x3040 && c <= 0x30FF) ||
@@ -56,28 +56,24 @@ static BOOL GSHasCJK(NSString *s) {
     return NO;
 }
 
-// 拒绝 ML/技术标识符、纯英文蛇形命名
 static BOOL GSIsTechIdentifier(NSString *t) {
     if (t.length == 0) return YES;
     NSString *l = t.lowercaseString;
-    // hierarchical_inner_product_0 这类
     if ([l rangeOfString:@"^[a-z][a-z0-9_]*$" options:NSRegularExpressionSearch].location != NSNotFound) {
-        if ([l containsString:@"_"]) return YES; // snake_case 一律不当标题
+        if ([l containsString:@"_"]) return YES;
     }
     NSArray *bad = @[
         @"hierarchical", @"inner_product", @"tensor", @"embedding", @"layer", @"model",
-        @"softmax", @"relu", @"conv", @"logits", @"weight", @"bias", @"gradient",
-        @"flutter", @"dart", @"null", @"undefined", @"true", @"false", @"object"
+        @"softmax", @"relu", @"conv", @"logits", @"weight", @"bias", @"flutter", @"dart",
+        @"null", @"undefined", @"object", @"true", @"false"
     ];
-    for (NSString *b in bad) {
+    for (NSString *b in bad)
         if ([l containsString:b]) return YES;
-    }
-    // 全是 ascii 字母数字下划线且无空格 → 技术串
-    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:
-                               @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.:"];
-    if ([t rangeOfCharacterFromSet:[allowed invertedSet]].location == NSNotFound && !GSHasCJK(t)) {
-        if ([t containsString:@"_"] || t.length < 8) return YES;
-    }
+    NSCharacterSet *allowed = [NSCharacterSet
+        characterSetWithCharactersInString:
+            @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.:"];
+    if ([t rangeOfCharacterFromSet:[allowed invertedSet]].location == NSNotFound && !GSHasCJK(t))
+        return YES;
     return NO;
 }
 
@@ -87,72 +83,51 @@ static BOOL GSLooksLikeTitle(NSString *t) {
     if (t.length < 2) return NO;
     if ([t hasPrefix:@"http"] || [t containsString:@"m3u8"] || [t containsString:@".mp4"]) return NO;
     if (GSIsTechIdentifier(t)) return NO;
-    NSArray *uiNoise = @[
-        @"关闭", @"复制", @"播放信息", @"分辨率", @"视频标题", @"视频URL", @"推送到", @"NAS",
-        @"hooks", @"1.0X", @"1.0x", @"全屏", @"倍速", @"选集", @"i", @"AVPlayer", @"IJK", @"FVP",
-        @"未获取", @"等待", @"成功", @"失败", @"调试", @"JSON", @"OCR", @"A11y", @"Meta", @"M3U8"
+    NSArray *noise = @[
+        @"关闭", @"复制", @"播放信息", @"分辨率", @"视频标题", @"视频URL", @"推送到", @"NAS", @"调试",
+        @"1.0X", @"全屏", @"倍速", @"i", @"AVPlayer", @"JSON", @"OCR", @"A11y", @"Meta", @"M3U8",
+        @"未获取", @"等待", @"hooks"
     ];
-    for (NSString *b in uiNoise) {
+    for (NSString *b in noise)
         if ([t isEqualToString:b]) return NO;
-    }
     if ([t rangeOfString:@"^\\d{1,2}:\\d{2}(:\\d{2})?$" options:NSRegularExpressionSearch].location !=
         NSNotFound)
         return NO;
-    // 视频标题必须含中日文（本 App 片名均为中文/日文）
-    if (!GSHasCJK(t)) return NO;
-    return YES;
+    // 本 App 片名必须含中日文
+    return GSHasCJK(t);
 }
 
 static BOOL GSIsNoiseHost(NSString *u) {
     NSString *l = u.lowercaseString;
     return [l containsString:@"umeng"] || [l containsString:@"apple.com"] ||
-           [l containsString:@"icloud.com"] || [l containsString:@"firebase"] ||
-           [l containsString:@"googleapis"] || [l containsString:@"crashlytics"] ||
-           [l containsString:@"sentry"] || [l containsString:@"bugly"] ||
-           [l containsString:@"adjust.com"];
+           [l containsString:@"firebase"] || [l containsString:@"googleapis"] ||
+           [l containsString:@"crashlytics"] || [l containsString:@"sentry"] ||
+           [l containsString:@"bugly"] || [l containsString:@"icloud.com"];
 }
 
 static BOOL GSLooksMediaURL(NSString *u) {
     if (u.length < 8 || GSIsNoiseHost(u)) return NO;
     NSString *l = u.lowercaseString;
-    if (!([l hasPrefix:@"http://"] || [l hasPrefix:@"https://"] || [l hasPrefix:@"file://"]))
-        return NO;
+    if (!([l hasPrefix:@"http://"] || [l hasPrefix:@"https://"])) return NO;
     return [l containsString:@"m3u8"] || [l containsString:@".mp4"] || [l containsString:@"/hls/"] ||
-           [l containsString:@"playlist"] || [l containsString:@"getvideourl"] ||
            [l containsString:@"/h5/m3u8"] || [l containsString:@"film_m3u8"] ||
-           [l containsString:@"short_m3u8"] || [l containsString:@"play_url"] ||
-           [l containsString:@".flv"] || [l containsString:@".ts"];
+           [l containsString:@"getvideourl"] || [l containsString:@"play_url"] ||
+           [l containsString:@"playlist"] || [l containsString:@".flv"];
 }
 
 static void GSRecomputeBestTitle(void) {
-    // 优先级：JSON(display_title类) > A11y > OCR > AVMeta > M3U8
-    NSArray *order = @[
-        gTitleJSON ?: @"", gTitleA11y ?: @"", gTitleOCR ?: @"", gTitleAVMeta ?: @"",
-        gTitleM3U8 ?: @""
-    ];
-    NSString *best = @"";
-    for (NSString *t in order) {
-        if (GSLooksLikeTitle(t)) {
-            if (!best.length || (t.length > best.length && GSHasCJK(t))) best = t;
-            if (best.length && GSHasCJK(best)) {
-                // 已有合格中文标题，取第一个优先源中最长合理的
-                if (t.length >= best.length) best = t;
-                break;
-            }
-        }
-    }
-    // 若第一优先源合格直接用
     if (GSLooksLikeTitle(gTitleJSON))
-        best = gTitleJSON;
+        gTitleBest = gTitleJSON;
     else if (GSLooksLikeTitle(gTitleA11y))
-        best = gTitleA11y;
+        gTitleBest = gTitleA11y;
     else if (GSLooksLikeTitle(gTitleOCR))
-        best = gTitleOCR;
+        gTitleBest = gTitleOCR;
     else if (GSLooksLikeTitle(gTitleAVMeta))
-        best = gTitleAVMeta;
+        gTitleBest = gTitleAVMeta;
     else if (GSLooksLikeTitle(gTitleM3U8))
-        best = gTitleM3U8;
-    gTitleBest = best ?: @"";
+        gTitleBest = gTitleM3U8;
+    else
+        gTitleBest = @"";
 }
 
 static void GSSetTitle(NSString *t, NSString *source) {
@@ -172,17 +147,10 @@ static void GSSetTitle(NSString *t, NSString *source) {
 }
 
 static void GSRememberURL(NSString *u, NSString *source) {
-    if (u.length == 0 || GSIsNoiseHost(u)) return;
-    BOOL media = GSLooksMediaURL(u) || [source hasPrefix:@"AV"] || [source hasPrefix:@"IJK"] ||
-                 [source hasPrefix:@"FVP"] || [source hasPrefix:@"JSON"];
-    if (!media) return;
-    if (!gURLHistory) gURLHistory = [NSMutableArray array];
-    @synchronized (gURLHistory) {
-        if (!gURLHistory.count || ![gURLHistory.lastObject isEqualToString:u]) {
-            [gURLHistory addObject:u];
-            if (gURLHistory.count > 8) [gURLHistory removeObjectAtIndex:0];
-        }
-    }
+    if (!GSLooksMediaURL(u) &&
+        !([source hasPrefix:@"AV"] || [source hasPrefix:@"IJK"] || [source hasPrefix:@"FVP"]))
+        return;
+    if (GSIsNoiseHost(u)) return;
     gURL = [u copy];
     if (source.length) gExtra = [source copy];
 }
@@ -196,6 +164,12 @@ static void GSRememberSize(CGFloat w, CGFloat h) {
 
 static NSString *GSResText(void) {
     return (gW > 0 && gH > 0) ? [NSString stringWithFormat:@"%ldx%ld", (long)gW, (long)gH] : @"(未获取)";
+}
+
+static NSString *GSDash(NSString *s) {
+    if (!s.length) return @"-";
+    if (s.length > 28) return [[s substringToIndex:28] stringByAppendingString:@"…"];
+    return s;
 }
 
 static UIWindow *GSKeyWindow(void) {
@@ -220,7 +194,7 @@ static void GSToast(NSString *msg) {
       UIWindow *win = GSKeyWindow();
       if (!win) return;
       UILabel *lab = [[UILabel alloc]
-          initWithFrame:CGRectMake(40, win.bounds.size.height * 0.42, win.bounds.size.width - 80, 40)];
+          initWithFrame:CGRectMake(40, win.bounds.size.height * 0.4, win.bounds.size.width - 80, 40)];
       lab.text = msg;
       lab.textAlignment = NSTextAlignmentCenter;
       lab.textColor = UIColor.whiteColor;
@@ -235,112 +209,71 @@ static void GSToast(NSString *msg) {
     });
 }
 
-static void GSUpdateDebugBar(void);
 static void GSRefreshPanelLabels(void);
 
-#pragma mark - AVAsset metadata title (官方元数据)
+#pragma mark - AV metadata
 
 static void GSLoadAVMetadataTitle(AVAsset *asset) {
     if (!asset) return;
     NSTimeInterval now = CFAbsoluteTimeGetCurrent();
-    if (now - gLastMetaLoad < 1.5 && gTitleAVMeta.length) return;
-    gLastMetaLoad = now;
-    gLastAsset = asset;
+    if (now - gLastMeta < 2.0 && gTitleAVMeta.length) return;
+    gLastMeta = now;
 
-    // 已加载的 commonMetadata
-    NSArray *items = asset.commonMetadata;
-    for (AVMetadataItem *it in items) {
-        NSString *key = [it.commonKey description];
-        id val = it.value;
-        NSString *s = nil;
-        if ([val isKindOfClass:[NSString class]])
-            s = val;
-        else if ([val isKindOfClass:[NSData class]])
-            s = [[NSString alloc] initWithData:val encoding:NSUTF8StringEncoding];
-        else
-            s = [it.stringValue copy];
-        if (!s.length) continue;
-        // title / title-sort / albumName 等
-        if ([key isEqualToString:AVMetadataCommonKeyTitle] ||
-            [key isEqualToString:@"title"] ||
-            [it.keySpace isEqualToString:AVMetadataKeySpaceCommon]) {
+    @try {
+        for (AVMetadataItem *it in asset.commonMetadata) {
+            NSString *s = it.stringValue;
+            if (!s.length && [it.value isKindOfClass:[NSString class]]) s = (NSString *)it.value;
             if (GSLooksLikeTitle(s)) {
                 GSSetTitle(s, @"AVMeta");
-                dispatch_async(dispatch_get_main_queue(), ^{
-                  GSUpdateDebugBar();
-                  GSRefreshPanelLabels();
-                });
+                dispatch_async(dispatch_get_main_queue(), ^{ GSRefreshPanelLabels(); });
                 return;
             }
         }
+    } @catch (__unused NSException *e) {
     }
 
-    // 异步加载更多 metadata
-    NSArray *keys = @[ @"commonMetadata", @"availableMetadataFormats" ];
-    [asset loadValuesAsynchronouslyForKeys:keys completionHandler:^{
-      NSError *e = nil;
-      if ([asset statusOfValueForKey:@"commonMetadata" error:&e] != AVKeyValueStatusLoaded) return;
-      NSArray *meta = [AVMetadataItem metadataItemsFromArray:asset.commonMetadata
-                                                     withKey:AVMetadataCommonKeyTitle
-                                                    keySpace:AVMetadataKeySpaceCommon];
-      for (AVMetadataItem *it in meta) {
-          NSString *s = it.stringValue;
-          if (GSLooksLikeTitle(s)) {
-              GSSetTitle(s, @"AVMeta");
-              dispatch_async(dispatch_get_main_queue(), ^{
-                GSUpdateDebugBar();
-                GSRefreshPanelLabels();
-              });
+    [asset loadValuesAsynchronouslyForKeys:@[ @"commonMetadata" ] completionHandler:^{
+      @try {
+          if ([asset statusOfValueForKey:@"commonMetadata" error:nil] != AVKeyValueStatusLoaded)
               return;
-          }
-      }
-      // iTunes / QuickTime 空间
-      for (NSString *fmt in asset.availableMetadataFormats) {
-          NSArray *arr = [asset metadataForFormat:fmt];
-          for (AVMetadataItem *it in arr) {
-              NSString *s = it.stringValue;
-              if (GSLooksLikeTitle(s)) {
-                  GSSetTitle(s, @"AVMeta");
-                  dispatch_async(dispatch_get_main_queue(), ^{
-                    GSUpdateDebugBar();
-                    GSRefreshPanelLabels();
-                  });
+          NSArray *meta = [AVMetadataItem metadataItemsFromArray:asset.commonMetadata
+                                                         withKey:AVMetadataCommonKeyTitle
+                                                        keySpace:AVMetadataKeySpaceCommon];
+          for (AVMetadataItem *it in meta) {
+              if (GSLooksLikeTitle(it.stringValue)) {
+                  GSSetTitle(it.stringValue, @"AVMeta");
+                  dispatch_async(dispatch_get_main_queue(), ^{ GSRefreshPanelLabels(); });
                   return;
               }
           }
+      } @catch (__unused NSException *e) {
       }
     }];
 }
 
-#pragma mark - m3u8 文本解析标题
+#pragma mark - m3u8 (safe, no session swizzle re-entry)
 
 static void GSParseM3U8ForTitle(NSString *text) {
-    if (text.length < 8) return;
-    // #EXTINF:10.0,标题
-    NSRegularExpression *re1 =
+    if (text.length < 10) return;
+    NSUInteger lim = MIN(text.length, (NSUInteger)6000);
+    NSRegularExpression *re =
         [NSRegularExpression regularExpressionWithPattern:@"#EXTINF:[^,]*,\\s*(.+)"
                                                   options:0
                                                     error:nil];
-    NSTextCheckingResult *m1 =
-        [re1 firstMatchInString:text options:0 range:NSMakeRange(0, MIN(text.length, (NSUInteger)8000))];
-    if (m1 && m1.numberOfRanges > 1) {
-        NSString *t = [text substringWithRange:[m1 rangeAtIndex:1]];
-        t = [t stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSTextCheckingResult *m =
+        [re firstMatchInString:text options:0 range:NSMakeRange(0, lim)];
+    if (m.numberOfRanges > 1) {
+        NSString *t = [[text substringWithRange:[m rangeAtIndex:1]]
+            stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if (GSLooksLikeTitle(t)) {
             GSSetTitle(t, @"M3U8");
             return;
         }
     }
-    // #EXT-X-SESSION-DATA:DATA-ID="com.example.title",VALUE="..."
-    // #EXT-X-MEDIA:NAME="..."
-    NSRegularExpression *re2 = [NSRegularExpression
-        regularExpressionWithPattern:@"NAME=\"([^\"]+)\""
-                             options:0
-                               error:nil];
-    NSArray *ms = [re2 matchesInString:text options:0 range:NSMakeRange(0, MIN(text.length, (NSUInteger)8000))];
-    for (NSTextCheckingResult *m in ms) {
-        if (m.numberOfRanges < 2) continue;
-        NSString *t = [text substringWithRange:[m rangeAtIndex:1]];
+    re = [NSRegularExpression regularExpressionWithPattern:@"NAME=\"([^\"]+)\"" options:0 error:nil];
+    for (NSTextCheckingResult *r in [re matchesInString:text options:0 range:NSMakeRange(0, lim)]) {
+        if (r.numberOfRanges < 2) continue;
+        NSString *t = [text substringWithRange:[r rangeAtIndex:1]];
         if (GSLooksLikeTitle(t)) {
             GSSetTitle(t, @"M3U8");
             return;
@@ -349,56 +282,55 @@ static void GSParseM3U8ForTitle(NSString *text) {
 }
 
 static void GSFetchM3U8TitleIfNeeded(NSString *url) {
-    if (!GSLooksMediaURL(url)) return;
-    if (![url.lowercaseString containsString:@"m3u8"]) return;
-    static NSString *last = nil;
-    if ([last isEqualToString:url] && gTitleM3U8.length) return;
-    last = [url copy];
-    NSURLRequest *req = [NSURLRequest requestWithURL:[NSURL URLWithString:url]
-                                         cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
-                                     timeoutInterval:12];
+    if (!url.length || ![url.lowercaseString containsString:@"m3u8"]) return;
+    if ([gLastM3U8URL isEqualToString:url] && gTitleM3U8.length) return;
+    NSTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (now - gLastM3U8Fetch < 3.0 && [gLastM3U8URL isEqualToString:url]) return;
+    gLastM3U8Fetch = now;
+    gLastM3U8URL = [url copy];
+
+    NSURL *nsurl = [NSURL URLWithString:url];
+    if (!nsurl) return;
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:nsurl];
+    req.timeoutInterval = 10;
+    // 标记：走系统 session，hook 里看到 gInOurNetwork 只记 URL 不递归 fetch
+    gInOurNetwork = YES;
     [[[NSURLSession sharedSession]
         dataTaskWithRequest:req
           completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-            if (err || data.length < 10) return;
-            // 只当文本 playlist
+            gInOurNetwork = NO;
+            if (err || data.length < 8) return;
             NSString *txt = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-            if (!txt) txt = [[NSString alloc] initWithData:data encoding:NSISOLatin1StringEncoding];
-            if (![txt containsString:@"#EXTM3U"] && ![txt containsString:@"#EXTINF"]) return;
+            if (!txt) return;
+            if (![txt containsString:@"#EXT"]) return;
             GSParseM3U8ForTitle(txt);
-            dispatch_async(dispatch_get_main_queue(), ^{
-              GSUpdateDebugBar();
-              GSRefreshPanelLabels();
-            });
+            dispatch_async(dispatch_get_main_queue(), ^{ GSRefreshPanelLabels(); });
           }] resume];
+    // 若 resume 同步失败，复位
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ gInOurNetwork = NO; });
 }
 
-#pragma mark - JSON（仅可信键 + 强制中日文）
+#pragma mark - JSON
 
 static void GSScanJSON(id o, int depth) {
     if (!o || depth > 6) return;
     if ([o isKindOfClass:[NSDictionary class]]) {
         NSDictionary *d = (NSDictionary *)o;
-        static NSArray *urlKeys, *titleKeysPreferred, *titleKeysWeak;
+        static NSArray *urlKeys, *titlePreferred;
         static dispatch_once_t once;
         dispatch_once(&once, ^{
           urlKeys = @[
               @"playUrl", @"play_url", @"videoUrl", @"video_url", @"url", @"urlM3u8", @"mv_play_url",
-              @"preview_play_url", @"preview_play_url2", @"m3u8", @"link", @"play_url2"
+              @"m3u8", @"link", @"play_url2"
           ];
-          // 高可信：IPA 中确认存在
-          titleKeysPreferred = @[
+          titlePreferred = @[
               @"display_title", @"displayTitle", @"video_title", @"videoTitle", @"video_name",
               @"mv_title", @"mvTitle", @"play_title", @"playTitle", @"sp91_film_subject",
               @"sp91_small_video_subject"
           ];
-          // 低可信：必须 CJK 且长度>=4，且不要裸 name
-          titleKeysWeak = @[ @"title", @"caption", @"subject", @"headline" ];
         });
-
-        NSString *foundURL = nil;
-        NSString *foundTitle = nil;
-
+        NSString *foundURL = nil, *foundTitle = nil;
         for (NSString *k in urlKeys) {
             id v = d[k];
             if ([v isKindOfClass:[NSString class]] && GSLooksMediaURL(v)) {
@@ -406,57 +338,49 @@ static void GSScanJSON(id o, int depth) {
                 break;
             }
         }
-        for (NSString *k in titleKeysPreferred) {
+        for (NSString *k in titlePreferred) {
             id v = d[k];
             if ([v isKindOfClass:[NSString class]] && GSLooksLikeTitle(v)) {
                 foundTitle = v;
                 break;
             }
         }
+        // 弱键 title 仅中文≥4
         if (!foundTitle) {
-            for (NSString *k in titleKeysWeak) {
-                id v = d[k];
-                if ([v isKindOfClass:[NSString class]] && GSLooksLikeTitle(v) && GSHasCJK(v) &&
-                    [(NSString *)v length] >= 4) {
-                    foundTitle = v;
-                    break;
-                }
-            }
+            id v = d[@"title"];
+            if ([v isKindOfClass:[NSString class]] && GSLooksLikeTitle(v) && [(NSString *)v length] >= 4)
+                foundTitle = v;
         }
-        // 不再扫描通用 "name" 字段（易误伤 ML/技术字段）
-
         if (foundURL) {
             GSRememberURL(foundURL, @"JSON");
-            GSFetchM3U8TitleIfNeeded(foundURL);
+            if (!gInOurNetwork) GSFetchM3U8TitleIfNeeded(foundURL);
         }
         if (foundTitle) GSSetTitle(foundTitle, @"JSON");
 
         NSInteger n = 0;
         for (id key in d) {
             id v = d[key];
-            if (++n > 80) break;
+            if (++n > 60) break;
             if ([v isKindOfClass:[NSDictionary class]] || [v isKindOfClass:[NSArray class]])
                 GSScanJSON(v, depth + 1);
         }
     } else if ([o isKindOfClass:[NSArray class]]) {
         NSInteger n = 0;
         for (id v in (NSArray *)o) {
-            if (++n > 40) break;
+            if (++n > 30) break;
             GSScanJSON(v, depth + 1);
         }
     }
 }
 
-#pragma mark - A11y + OCR
+#pragma mark - A11y / OCR
 
 static void GSWalkA11y(UIView *view, int depth, CGFloat screenH, NSMutableArray *out) {
-    if (!view || depth > 18 || view.hidden || view.alpha < 0.05) return;
-    if (view == gBtn || view == gPanel || view == gDebugBar) return;
+    if (!view || depth > 16 || view.hidden || view.alpha < 0.05) return;
+    if (view == gBtn || view == gPanel) return;
     CGRect fr = [view convertRect:view.bounds toView:nil];
     CGFloat midY = CGRectGetMidY(fr);
-    if (screenH > 0 && midY > screenH * 0.55) {
-        // 仍遍历子视图（布局可能奇怪）
-    } else {
+    if (midY < screenH * 0.55) {
         if ([view isKindOfClass:[UILabel class]]) {
             NSString *t = ((UILabel *)view).text;
             if (GSLooksLikeTitle(t)) [out addObject:@{@"t" : t, @"y" : @(midY), @"len" : @(t.length)}];
@@ -510,15 +434,14 @@ static void GSScanA11yTitle(void) {
 static void GSOcrTopTitle(void) {
     if (GSLooksLikeTitle(gTitleBest) && gTitleBest.length >= 4) return;
     NSTimeInterval now = CFAbsoluteTimeGetCurrent();
-    if (now - gLastOCR < 2.2) return;
+    if (now - gLastOCR < 2.5) return;
     gLastOCR = now;
     UIWindow *win = GSKeyWindow();
     if (!win) return;
     CGFloat scale = UIScreen.mainScreen.scale;
     CGFloat topInset = 0;
     if (@available(iOS 11.0, *)) topInset = win.safeAreaInsets.top;
-    // 顶栏中央标题区（避开左侧返回、右侧按钮）
-    CGRect band = CGRectMake(56, topInset + 0, MAX(80, win.bounds.size.width - 120), 48);
+    CGRect band = CGRectMake(56, topInset, MAX(80, win.bounds.size.width - 120), 48);
     UIGraphicsBeginImageContextWithOptions(band.size, NO, scale);
     CGContextRef ctx = UIGraphicsGetCurrentContext();
     if (!ctx) {
@@ -548,7 +471,6 @@ static void GSOcrTopTitle(void) {
           if (best.length) {
               dispatch_async(dispatch_get_main_queue(), ^{
                 GSSetTitle(best, @"OCR");
-                GSUpdateDebugBar();
                 GSRefreshPanelLabels();
               });
           }
@@ -557,8 +479,11 @@ static void GSOcrTopTitle(void) {
     req.usesLanguageCorrection = NO;
     if (@available(iOS 14.0, *))
         req.recognitionLanguages = @[ @"zh-Hans", @"zh-Hant", @"ja", @"en" ];
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-      [handler performRequests:@[ req ] error:nil];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+      @try {
+          [handler performRequests:@[ req ] error:nil];
+      } @catch (__unused NSException *e) {
+      }
     });
 }
 
@@ -569,17 +494,20 @@ static void GSSampleAV(AVPlayer *player) {
     gLastAV = player;
     AVPlayerItem *item = player.currentItem;
     if (!item) return;
-    CGSize s = item.presentationSize;
-    GSRememberSize(s.width, s.height);
-    AVAsset *asset = item.asset;
-    if ([asset isKindOfClass:[AVURLAsset class]]) {
-        NSString *u = ((AVURLAsset *)asset).URL.absoluteString;
-        if (u.length) {
-            GSRememberURL(u, @"AVPlayer");
-            GSFetchM3U8TitleIfNeeded(u);
+    @try {
+        CGSize s = item.presentationSize;
+        GSRememberSize(s.width, s.height);
+        AVAsset *asset = item.asset;
+        if ([asset isKindOfClass:[AVURLAsset class]]) {
+            NSString *u = ((AVURLAsset *)asset).URL.absoluteString;
+            if (u.length) {
+                GSRememberURL(u, @"AVPlayer");
+                if (!gInOurNetwork) GSFetchM3U8TitleIfNeeded(u);
+            }
         }
+        GSLoadAVMetadataTitle(asset);
+    } @catch (__unused NSException *e) {
     }
-    GSLoadAVMetadataTitle(asset);
 }
 
 static void GSSampleIJK(id ijk) {
@@ -596,7 +524,7 @@ static void GSSampleIJK(id ijk) {
     gExtra = @"IJK";
 }
 
-#pragma mark - Swizzle
+#pragma mark - Swizzle (safe)
 
 static void GSSwizzleInst(Class cls, SEL sel, IMP neu, IMP *orig) {
     if (!cls || !sel || !neu || !orig || *orig) return;
@@ -619,12 +547,13 @@ static IMP o_ijk_s, o_ijk_so, o_ijk_u, o_ijk_uo, o_ijk_ds, o_ijk_prep;
 static IMP o_fvp_url, o_fvpt_url;
 static IMP o_av_replace, o_av_initURL, o_av_playerWithURL;
 static IMP o_item_initURL, o_item_withURL, o_asset_initURL, o_asset_withURL;
-static IMP o_sess_req, o_sess_url, o_sess_req_c, o_sess_url_c, o_json;
+static IMP o_sess_req, o_sess_url; // 不再 hook completion 版
+static IMP o_json;
 
 static id h_ijk_s(id s, SEL c, id u) {
     if ([u isKindOfClass:[NSString class]]) {
         GSRememberURL(u, @"IJK");
-        GSFetchM3U8TitleIfNeeded(u);
+        if (!gInOurNetwork) GSFetchM3U8TitleIfNeeded(u);
     }
     id r = ((id(*)(id, SEL, id))o_ijk_s)(s, c, u);
     GSSampleIJK(r ?: s);
@@ -633,43 +562,43 @@ static id h_ijk_s(id s, SEL c, id u) {
 static id h_ijk_so(id s, SEL c, id u, id o) {
     if ([u isKindOfClass:[NSString class]]) {
         GSRememberURL(u, @"IJK");
-        GSFetchM3U8TitleIfNeeded(u);
+        if (!gInOurNetwork) GSFetchM3U8TitleIfNeeded(u);
     }
     id r = ((id(*)(id, SEL, id, id))o_ijk_so)(s, c, u, o);
     GSSampleIJK(r ?: s);
     return r;
 }
 static id h_ijk_u(id s, SEL c, id u) {
-    NSString *us = [u isKindOfClass:[NSURL class]] ? [(NSURL *)u absoluteString]
-                   : [u isKindOfClass:[NSString class]] ? u
-                                                        : nil;
+    NSString *us = [u isKindOfClass:[NSURL class]]
+                       ? [(NSURL *)u absoluteString]
+                       : ([u isKindOfClass:[NSString class]] ? u : nil);
     if (us) {
         GSRememberURL(us, @"IJK");
-        GSFetchM3U8TitleIfNeeded(us);
+        if (!gInOurNetwork) GSFetchM3U8TitleIfNeeded(us);
     }
     id r = ((id(*)(id, SEL, id))o_ijk_u)(s, c, u);
     GSSampleIJK(r ?: s);
     return r;
 }
 static id h_ijk_uo(id s, SEL c, id u, id o) {
-    NSString *us = [u isKindOfClass:[NSURL class]] ? [(NSURL *)u absoluteString]
-                   : [u isKindOfClass:[NSString class]] ? u
-                                                        : nil;
+    NSString *us = [u isKindOfClass:[NSURL class]]
+                       ? [(NSURL *)u absoluteString]
+                       : ([u isKindOfClass:[NSString class]] ? u : nil);
     if (us) {
         GSRememberURL(us, @"IJK");
-        GSFetchM3U8TitleIfNeeded(us);
+        if (!gInOurNetwork) GSFetchM3U8TitleIfNeeded(us);
     }
     id r = ((id(*)(id, SEL, id, id))o_ijk_uo)(s, c, u, o);
     GSSampleIJK(r ?: s);
     return r;
 }
 static void h_ijk_ds(id s, SEL c, id u) {
-    NSString *us = [u isKindOfClass:[NSURL class]] ? [(NSURL *)u absoluteString]
-                   : [u isKindOfClass:[NSString class]] ? u
-                                                        : nil;
+    NSString *us = [u isKindOfClass:[NSURL class]]
+                       ? [(NSURL *)u absoluteString]
+                       : ([u isKindOfClass:[NSString class]] ? u : nil);
     if (us) {
         GSRememberURL(us, @"IJK-ds");
-        GSFetchM3U8TitleIfNeeded(us);
+        if (!gInOurNetwork) GSFetchM3U8TitleIfNeeded(us);
     }
     if (o_ijk_ds) ((void(*)(id, SEL, id))o_ijk_ds)(s, c, u);
     GSSampleIJK(s);
@@ -678,13 +607,14 @@ static void h_ijk_prep(id s, SEL c) {
     if (o_ijk_prep) ((void(*)(id, SEL))o_ijk_prep)(s, c);
     GSSampleIJK(s);
 }
+
 static id h_fvp_url(id s, SEL c, id url, id h, id a, id r) {
     NSString *us = [url isKindOfClass:[NSString class]]
                        ? url
                        : ([url isKindOfClass:[NSURL class]] ? [(NSURL *)url absoluteString] : nil);
     if (us) {
         GSRememberURL(us, @"FVP");
-        GSFetchM3U8TitleIfNeeded(us);
+        if (!gInOurNetwork) GSFetchM3U8TitleIfNeeded(us);
     }
     id x = ((id(*)(id, SEL, id, id, id, id))o_fvp_url)(s, c, url, h, a, r);
     @try {
@@ -700,7 +630,7 @@ static id h_fvpt_url(id s, SEL c, id url, id fu, id dl, id h, id a, id r, id od)
                        : ([url isKindOfClass:[NSURL class]] ? [(NSURL *)url absoluteString] : nil);
     if (us) {
         GSRememberURL(us, @"FVP-tex");
-        GSFetchM3U8TitleIfNeeded(us);
+        if (!gInOurNetwork) GSFetchM3U8TitleIfNeeded(us);
     }
     id x = ((id(*)(id, SEL, id, id, id, id, id, id, id))o_fvpt_url)(s, c, url, fu, dl, h, a, r, od);
     @try {
@@ -710,14 +640,16 @@ static id h_fvpt_url(id s, SEL c, id url, id fu, id dl, id h, id a, id r, id od)
     }
     return x;
 }
+
 static void h_av_replace(id s, SEL c, id item) {
     ((void(*)(id, SEL, id))o_av_replace)(s, c, item);
     if ([s isKindOfClass:[AVPlayer class]]) GSSampleAV(s);
 }
 static id h_av_initURL(id s, SEL c, id url) {
     if ([url isKindOfClass:[NSURL class]]) {
-        GSRememberURL([(NSURL *)url absoluteString], @"AVPlayer");
-        GSFetchM3U8TitleIfNeeded([(NSURL *)url absoluteString]);
+        NSString *us = [(NSURL *)url absoluteString];
+        GSRememberURL(us, @"AVPlayer");
+        if (!gInOurNetwork) GSFetchM3U8TitleIfNeeded(us);
     }
     id r = ((id(*)(id, SEL, id))o_av_initURL)(s, c, url);
     if ([r isKindOfClass:[AVPlayer class]]) GSSampleAV(r);
@@ -725,8 +657,9 @@ static id h_av_initURL(id s, SEL c, id url) {
 }
 static id h_av_playerWithURL(id s, SEL c, id url) {
     if ([url isKindOfClass:[NSURL class]]) {
-        GSRememberURL([(NSURL *)url absoluteString], @"AVPlayer");
-        GSFetchM3U8TitleIfNeeded([(NSURL *)url absoluteString]);
+        NSString *us = [(NSURL *)url absoluteString];
+        GSRememberURL(us, @"AVPlayer");
+        if (!gInOurNetwork) GSFetchM3U8TitleIfNeeded(us);
     }
     id r = ((id(*)(id, SEL, id))o_av_playerWithURL)(s, c, url);
     if ([r isKindOfClass:[AVPlayer class]]) GSSampleAV(r);
@@ -734,15 +667,17 @@ static id h_av_playerWithURL(id s, SEL c, id url) {
 }
 static id h_item_initURL(id s, SEL c, id url) {
     if ([url isKindOfClass:[NSURL class]]) {
-        GSRememberURL([(NSURL *)url absoluteString], @"AVItem");
-        GSFetchM3U8TitleIfNeeded([(NSURL *)url absoluteString]);
+        NSString *us = [(NSURL *)url absoluteString];
+        GSRememberURL(us, @"AVItem");
+        if (!gInOurNetwork) GSFetchM3U8TitleIfNeeded(us);
     }
     return ((id(*)(id, SEL, id))o_item_initURL)(s, c, url);
 }
 static id h_item_withURL(id s, SEL c, id url) {
     if ([url isKindOfClass:[NSURL class]]) {
-        GSRememberURL([(NSURL *)url absoluteString], @"AVItem");
-        GSFetchM3U8TitleIfNeeded([(NSURL *)url absoluteString]);
+        NSString *us = [(NSURL *)url absoluteString];
+        GSRememberURL(us, @"AVItem");
+        if (!gInOurNetwork) GSFetchM3U8TitleIfNeeded(us);
     }
     return ((id(*)(id, SEL, id))o_item_withURL)(s, c, url);
 }
@@ -750,7 +685,7 @@ static id h_asset_initURL(id s, SEL c, id url, id o) {
     if ([url isKindOfClass:[NSURL class]]) {
         NSString *us = [(NSURL *)url absoluteString];
         GSRememberURL(us, @"AVURLAsset");
-        GSFetchM3U8TitleIfNeeded(us);
+        if (!gInOurNetwork) GSFetchM3U8TitleIfNeeded(us);
     }
     id r = ((id(*)(id, SEL, id, id))o_asset_initURL)(s, c, url, o);
     if ([r isKindOfClass:[AVAsset class]]) GSLoadAVMetadataTitle(r);
@@ -760,68 +695,39 @@ static id h_asset_withURL(id s, SEL c, id url, id o) {
     if ([url isKindOfClass:[NSURL class]]) {
         NSString *us = [(NSURL *)url absoluteString];
         GSRememberURL(us, @"AVURLAsset");
-        GSFetchM3U8TitleIfNeeded(us);
+        if (!gInOurNetwork) GSFetchM3U8TitleIfNeeded(us);
     }
     id r = ((id(*)(id, SEL, id, id))o_asset_withURL)(s, c, url, o);
     if ([r isKindOfClass:[AVAsset class]]) GSLoadAVMetadataTitle(r);
     return r;
 }
-static void GSCapReq(NSURLRequest *req, NSString *tag) {
-    if (![req isKindOfClass:[NSURLRequest class]]) return;
-    NSString *u = req.URL.absoluteString;
-    if (!u.length) return;
-    GSRememberURL(u, tag);
-    GSFetchM3U8TitleIfNeeded(u);
-}
+
+// 只 hook 非 completion 版本，避免 block ABI 闪退
 static id h_sess_req(id s, SEL c, id req) {
-    GSCapReq(req, @"NET");
+    if (!gInOurNetwork && [req isKindOfClass:[NSURLRequest class]]) {
+        NSString *u = [(NSURLRequest *)req URL].absoluteString;
+        if (u.length) {
+            GSRememberURL(u, @"NET");
+            // 不在这里同步 fetch，避免重入；tick/面板里再拉
+        }
+    }
     return ((id(*)(id, SEL, id))o_sess_req)(s, c, req);
 }
 static id h_sess_url(id s, SEL c, id url) {
-    if ([url isKindOfClass:[NSURL class]]) {
+    if (!gInOurNetwork && [url isKindOfClass:[NSURL class]]) {
         GSRememberURL([(NSURL *)url absoluteString], @"NET");
-        GSFetchM3U8TitleIfNeeded([(NSURL *)url absoluteString]);
     }
     return ((id(*)(id, SEL, id))o_sess_url)(s, c, url);
 }
-static id h_sess_req_c(id s, SEL c, id req, id comp) {
-    GSCapReq(req, @"NET");
-    // 包装 completion：若响应是 JSON/m3u8 文本再解析
-    void (^orig)(NSData *, NSURLResponse *, NSError *) = comp;
-    void (^wrap)(NSData *, NSURLResponse *, NSError *) =
-        ^(NSData *data, NSURLResponse *resp, NSError *err) {
-          if (data.length > 8) {
-              NSString *txt = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-              if ([txt hasPrefix:@"#EXTM3U"] || [txt containsString:@"#EXTINF"])
-                  GSParseM3U8ForTitle(txt);
-              else {
-                  id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-                  if (obj) GSScanJSON(obj, 0);
-              }
-              dispatch_async(dispatch_get_main_queue(), ^{
-                GSUpdateDebugBar();
-                GSRefreshPanelLabels();
-              });
-          }
-          if (orig) orig(data, resp, err);
-        };
-    return ((id(*)(id, SEL, id, id))o_sess_req_c)(s, c, req, wrap);
-}
-static id h_sess_url_c(id s, SEL c, id url, id comp) {
-    if ([url isKindOfClass:[NSURL class]]) {
-        GSRememberURL([(NSURL *)url absoluteString], @"NET");
-        GSFetchM3U8TitleIfNeeded([(NSURL *)url absoluteString]);
-    }
-    return ((id(*)(id, SEL, id, id))o_sess_url_c)(s, c, url, comp);
-}
+
 static id h_json(id s, SEL c, id data, NSUInteger opt, NSError **err) {
     id obj = ((id(*)(id, SEL, id, NSUInteger, NSError **))o_json)(s, c, data, opt, err);
     if (obj) {
-        GSScanJSON(obj, 0);
-        dispatch_async(dispatch_get_main_queue(), ^{
-          GSUpdateDebugBar();
-          GSRefreshPanelLabels();
-        });
+        @try {
+            GSScanJSON(obj, 0);
+        } @catch (__unused NSException *e) {
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{ GSRefreshPanelLabels(); });
     }
     return obj;
 }
@@ -856,11 +762,12 @@ static void GSInstallHooks(void) {
     Class asset = [AVURLAsset class];
     GSSwizzleInst(asset, @selector(initWithURL:options:), (IMP)h_asset_initURL, &o_asset_initURL);
     GSSwizzleClass(asset, @selector(URLAssetWithURL:options:), (IMP)h_asset_withURL, &o_asset_withURL);
+
+    // 仅非 block 接口
     Class sess = [NSURLSession class];
     GSSwizzleInst(sess, @selector(dataTaskWithRequest:), (IMP)h_sess_req, &o_sess_req);
     GSSwizzleInst(sess, @selector(dataTaskWithURL:), (IMP)h_sess_url, &o_sess_url);
-    GSSwizzleInst(sess, @selector(dataTaskWithRequest:completionHandler:), (IMP)h_sess_req_c, &o_sess_req_c);
-    GSSwizzleInst(sess, @selector(dataTaskWithURL:completionHandler:), (IMP)h_sess_url_c, &o_sess_url_c);
+
     if (!o_json) {
         Method mm = class_getInstanceMethod(object_getClass((id)[NSJSONSerialization class]),
                                             @selector(JSONObjectWithData:options:error:));
@@ -880,13 +787,11 @@ static void GSPushToNAS(void) {
         return;
     }
     NSString *title = gTitleBest.length ? gTitleBest : @"未命名视频";
-    NSCharacterSet *bad =
-        [NSCharacterSet characterSetWithCharactersInString:@"\\/:*?\"<>|\n\r\t"];
+    NSCharacterSet *bad = [NSCharacterSet characterSetWithCharactersInString:@"\\/:*?\"<>|\n\r\t"];
     title = [[title componentsSeparatedByCharactersInSet:bad] componentsJoinedByString:@"_"];
     if (title.length > 80) title = [title substringToIndex:80];
-    NSData *json = [NSJSONSerialization dataWithJSONObject:@{@"url" : gURL, @"title" : title}
-                                                   options:0
-                                                     error:nil];
+    NSData *json =
+        [NSJSONSerialization dataWithJSONObject:@{@"url" : gURL, @"title" : title} options:0 error:nil];
     if (!json) return;
     NSMutableURLRequest *req =
         [NSMutableURLRequest requestWithURL:[NSURL URLWithString:kGSNASDownloadURL]];
@@ -895,9 +800,11 @@ static void GSPushToNAS(void) {
     req.HTTPBody = json;
     req.timeoutInterval = 15;
     GSToast(@"正在推送到 NAS…");
+    gInOurNetwork = YES;
     [[[NSURLSession sharedSession]
         dataTaskWithRequest:req
           completionHandler:^(NSData *data, NSURLResponse *resp, NSError *error) {
+            gInOurNetwork = NO;
             dispatch_async(dispatch_get_main_queue(), ^{
               if (error) {
                   GSToast([NSString stringWithFormat:@"推送失败:%@", error.localizedDescription]);
@@ -921,11 +828,10 @@ static void GSPushToNAS(void) {
           }] resume];
 }
 
-#pragma mark - UI Panel + Debug + Draggable FAB
+#pragma mark - Panel UI
 
 @interface GSPlayerInfoTapTarget : NSObject <UIGestureRecognizerDelegate>
 + (instancetype)shared;
-- (void)onFab;
 - (void)onTick;
 - (void)onClosePanel;
 - (void)onCopyTitle;
@@ -935,31 +841,30 @@ static void GSPushToNAS(void) {
 - (void)onIJKNote:(NSNotification *)n;
 @end
 
-static NSString *GSDash(NSString *s) {
-    return s.length ? s : @"-";
-}
-
-static void GSUpdateDebugBar(void) {
-    if (!gDebugBar) return;
-    GSRecomputeBestTitle();
-    gDebugBar.text = [NSString
-        stringWithFormat:@"调试标题 | JSON:%@ | A11y:%@ | OCR:%@ | AVMeta:%@ | M3U8:%@ | 选用:%@",
-                         GSDash(gTitleJSON), GSDash(gTitleA11y), GSDash(gTitleOCR),
-                         GSDash(gTitleAVMeta), GSDash(gTitleM3U8), GSDash(gTitleBest)];
-}
-
 static void GSRefreshPanelLabels(void) {
     GSRecomputeBestTitle();
     if (gLabRes) gLabRes.text = [NSString stringWithFormat:@"分辨率：%@", GSResText()];
     if (gLabTitle)
-        gLabTitle.text = [NSString
-            stringWithFormat:@"标题：%@(点此复制)", gTitleBest.length ? gTitleBest : @"(未获取)"];
+        gLabTitle.text =
+            [NSString stringWithFormat:@"标题：%@(点此复制)", gTitleBest.length ? gTitleBest : @"(未获取)"];
     if (gLabURL)
         gLabURL.text =
             [NSString stringWithFormat:@"URL：%@(点此复制)", gURL.length ? gURL : @"(未获取)"];
+    if (gLabDebug) {
+        gLabDebug.text = [NSString
+            stringWithFormat:
+                @"调试标题来源（各方法）：\n"
+                 "JSON: %@\n"
+                 "A11y(无障碍): %@\n"
+                 "OCR(顶栏识别): %@\n"
+                 "AVMeta(播放器元数据): %@\n"
+                 "M3U8(playlist解析): %@\n"
+                 "选用: %@  | hooks=%@",
+                GSDash(gTitleJSON), GSDash(gTitleA11y), GSDash(gTitleOCR), GSDash(gTitleAVMeta),
+                GSDash(gTitleM3U8), GSDash(gTitleBest), gHooksOK ? @"OK" : @"NO"];
+    }
     gBtnNas.enabled = gURL.length > 0;
     gBtnNas.alpha = gURL.length ? 1 : 0.45;
-    GSUpdateDebugBar();
 }
 
 static void GSHidePanel(void) {
@@ -972,17 +877,21 @@ static void GSHidePanel(void) {
 static void GSShowPanel(void) {
     UIWindow *win = GSKeyWindow();
     if (!win) return;
-    GSScanA11yTitle();
-    if (!GSLooksLikeTitle(gTitleBest)) GSOcrTopTitle();
-    if (gLastAV) GSSampleAV(gLastAV);
-    if (gLastIJK) GSSampleIJK(gLastIJK);
-    if (gURL.length) GSFetchM3U8TitleIfNeeded(gURL);
+
+    @try {
+        GSScanA11yTitle();
+        if (gLastAV) GSSampleAV(gLastAV);
+        if (gLastIJK) GSSampleIJK(gLastIJK);
+        if (gURL.length && !gInOurNetwork) GSFetchM3U8TitleIfNeeded(gURL);
+        if (!GSLooksLikeTitle(gTitleBest)) GSOcrTopTitle();
+    } @catch (__unused NSException *e) {
+    }
 
     if (!gPanel) {
-        CGFloat W = MIN(win.bounds.size.width - 32, 360);
-        CGFloat H = 300;
+        CGFloat W = MIN(win.bounds.size.width - 28, 370);
+        CGFloat H = 420; // 给调试区留足高度
         gPanel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, W, H)];
-        gPanel.backgroundColor = [[UIColor colorWithWhite:0.1 alpha:1] colorWithAlphaComponent:0.95];
+        gPanel.backgroundColor = [[UIColor colorWithWhite:0.1 alpha:1] colorWithAlphaComponent:0.96];
         gPanel.layer.cornerRadius = 14;
         gPanel.clipsToBounds = YES;
 
@@ -1001,25 +910,24 @@ static void GSShowPanel(void) {
             forControlEvents:UIControlEventTouchUpInside];
         [gPanel addSubview:close];
 
-        gLabRes = [[UILabel alloc] initWithFrame:CGRectMake(16, 46, W - 32, 22)];
-        gLabRes.textColor = [UIColor colorWithWhite:0.9 alpha:1];
+        gLabRes = [[UILabel alloc] initWithFrame:CGRectMake(16, 44, W - 32, 20)];
+        gLabRes.textColor = [UIColor colorWithWhite:0.92 alpha:1];
         gLabRes.font = [UIFont systemFontOfSize:14];
         [gPanel addSubview:gLabRes];
 
-        gLabTitle = [[UILabel alloc] initWithFrame:CGRectMake(16, 74, W - 32, 54)];
+        gLabTitle = [[UILabel alloc] initWithFrame:CGRectMake(16, 68, W - 32, 48)];
         gLabTitle.textColor = [UIColor colorWithRed:0.6 green:0.9 blue:1 alpha:1];
-        gLabTitle.font = [UIFont systemFontOfSize:14];
+        gLabTitle.font = [UIFont systemFontOfSize:13];
         gLabTitle.numberOfLines = 3;
         gLabTitle.userInteractionEnabled = YES;
-        [gLabTitle
-            addGestureRecognizer:[[UITapGestureRecognizer alloc]
-                                     initWithTarget:[GSPlayerInfoTapTarget shared]
-                                             action:@selector(onCopyTitle)]];
+        [gLabTitle addGestureRecognizer:[[UITapGestureRecognizer alloc]
+                                            initWithTarget:[GSPlayerInfoTapTarget shared]
+                                                    action:@selector(onCopyTitle)]];
         [gPanel addSubview:gLabTitle];
 
-        gLabURL = [[UILabel alloc] initWithFrame:CGRectMake(16, 132, W - 32, 70)];
+        gLabURL = [[UILabel alloc] initWithFrame:CGRectMake(16, 120, W - 32, 56)];
         gLabURL.textColor = [UIColor colorWithRed:0.55 green:1 blue:0.65 alpha:1];
-        gLabURL.font = [UIFont systemFontOfSize:12];
+        gLabURL.font = [UIFont systemFontOfSize:11];
         gLabURL.numberOfLines = 4;
         gLabURL.userInteractionEnabled = YES;
         [gLabURL addGestureRecognizer:[[UITapGestureRecognizer alloc]
@@ -1028,7 +936,7 @@ static void GSShowPanel(void) {
         [gPanel addSubview:gLabURL];
 
         gBtnNas = [UIButton buttonWithType:UIButtonTypeCustom];
-        gBtnNas.frame = CGRectMake(16, 220, W - 32, 50);
+        gBtnNas.frame = CGRectMake(16, 184, W - 32, 46);
         gBtnNas.backgroundColor = [UIColor colorWithRed:0.2 green:0.55 blue:0.95 alpha:1];
         gBtnNas.layer.cornerRadius = 10;
         [gBtnNas setTitle:@"推送到 NAS 下载" forState:UIControlStateNormal];
@@ -1039,18 +947,36 @@ static void GSShowPanel(void) {
             forControlEvents:UIControlEventTouchUpInside];
         [gPanel addSubview:gBtnNas];
 
+        // 面板底部调试区（位置充足）
+        UIView *dbgBox = [[UIView alloc] initWithFrame:CGRectMake(10, 242, W - 20, 164)];
+        dbgBox.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.9];
+        dbgBox.layer.cornerRadius = 8;
+        dbgBox.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.12].CGColor;
+        dbgBox.layer.borderWidth = 0.5;
+        [gPanel addSubview:dbgBox];
+
+        gLabDebug = [[UILabel alloc] initWithFrame:CGRectMake(8, 6, W - 36, 152)];
+        gLabDebug.textColor = [UIColor colorWithRed:1 green:0.88 blue:0.45 alpha:1];
+        gLabDebug.font = [UIFont systemFontOfSize:10];
+        gLabDebug.numberOfLines = 0;
+        gLabDebug.adjustsFontSizeToFitWidth = YES;
+        gLabDebug.minimumScaleFactor = 0.75;
+        [dbgBox addSubview:gLabDebug];
+
         [win addSubview:gPanel];
     } else if (gPanel.superview != win) {
         [gPanel removeFromSuperview];
         [win addSubview:gPanel];
     }
+
     gPanel.center = CGPointMake(CGRectGetMidX(win.bounds), CGRectGetMidY(win.bounds));
     gPanel.hidden = NO;
     gPanel.alpha = 0;
     [win bringSubviewToFront:gPanel];
     GSRefreshPanelLabels();
     [UIView animateWithDuration:0.2 animations:^{ gPanel.alpha = 1; }];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
                      GSScanA11yTitle();
                      GSRefreshPanelLabels();
@@ -1060,33 +986,20 @@ static void GSShowPanel(void) {
 static void GSLayoutFab(void) {
     UIWindow *win = GSKeyWindow();
     if (!win || !gBtn) return;
-    CGFloat top = 72; // 比之前更靠下
+    CGFloat top = 72;
     if (@available(iOS 11.0, *)) top = win.safeAreaInsets.top + 28;
     CGFloat side = 25;
     CGFloat x = win.bounds.size.width - side - 12 + gFabOffset.x;
     CGFloat y = top + gFabOffset.y;
-    // 限制在屏内
     x = MAX(4, MIN(x, win.bounds.size.width - side - 4));
     y = MAX(4, MIN(y, win.bounds.size.height - side - 4));
     gBtn.frame = CGRectMake(x, y, side, side);
     gBtn.layer.cornerRadius = side / 2.0;
     [win bringSubviewToFront:gBtn];
-    if (gDebugBar) [win bringSubviewToFront:gDebugBar];
     if (gPanel && !gPanel.hidden) [win bringSubviewToFront:gPanel];
 }
 
-static void GSLayoutDebugBar(void) {
-    UIWindow *win = GSKeyWindow();
-    if (!win || !gDebugBar) return;
-    CGFloat bottom = 6;
-    if (@available(iOS 11.0, *)) bottom = win.safeAreaInsets.bottom + 4;
-    CGFloat h = 54;
-    gDebugBar.frame =
-        CGRectMake(4, win.bounds.size.height - bottom - h, win.bounds.size.width - 8, h);
-    [win bringSubviewToFront:gDebugBar];
-}
-
-static void GSEnsureUI(void) {
+static void GSEnsureFab(void) {
     UIWindow *win = GSKeyWindow();
     if (!win) return;
     if (!gBtn) {
@@ -1098,7 +1011,6 @@ static void GSEnsureUI(void) {
         gBtn.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.35].CGColor;
         gBtn.layer.borderWidth = 0.5;
         gBtn.clipsToBounds = YES;
-        // 拖动 + 轻点都用 pan 手势（避免与 UIControl 冲突）
         UIPanGestureRecognizer *pan =
             [[UIPanGestureRecognizer alloc] initWithTarget:[GSPlayerInfoTapTarget shared]
                                                     action:@selector(onPan:)];
@@ -1109,23 +1021,7 @@ static void GSEnsureUI(void) {
         [gBtn removeFromSuperview];
         [win addSubview:gBtn];
     }
-    if (!gDebugBar) {
-        gDebugBar = [[UILabel alloc] initWithFrame:CGRectZero];
-        gDebugBar.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.72];
-        gDebugBar.textColor = [UIColor colorWithRed:1 green:0.85 blue:0.4 alpha:1];
-        gDebugBar.font = [UIFont systemFontOfSize:9];
-        gDebugBar.numberOfLines = 4;
-        gDebugBar.adjustsFontSizeToFitWidth = YES;
-        gDebugBar.minimumScaleFactor = 0.7;
-        gDebugBar.text = @"调试标题 | 等待采集…";
-        [win addSubview:gDebugBar];
-    } else if (gDebugBar.superview != win) {
-        [gDebugBar removeFromSuperview];
-        [win addSubview:gDebugBar];
-    }
     GSLayoutFab();
-    GSLayoutDebugBar();
-    GSUpdateDebugBar();
 }
 
 @implementation GSPlayerInfoTapTarget
@@ -1143,31 +1039,23 @@ static void GSEnsureUI(void) {
     UIWindow *win = GSKeyWindow();
     if (!win || !gBtn) return;
     if (pan.state == UIGestureRecognizerStateBegan) {
-        gFabMovedThisGesture = NO;
+        gFabMoved = NO;
     } else if (pan.state == UIGestureRecognizerStateChanged) {
         CGPoint t = [pan translationInView:win];
-        if (fabs(t.x) + fabs(t.y) > 3) gFabMovedThisGesture = YES;
+        if (fabs(t.x) + fabs(t.y) > 3) gFabMoved = YES;
         gFabOffset = CGPointMake(gFabOffset.x + t.x, gFabOffset.y + t.y);
         [pan setTranslation:CGPointZero inView:win];
         GSLayoutFab();
     } else if (pan.state == UIGestureRecognizerStateEnded ||
                pan.state == UIGestureRecognizerStateCancelled) {
-        if (!gFabMovedThisGesture) {
-            // 轻点 → 开关面板
+        if (!gFabMoved) {
             if (gPanel && !gPanel.hidden)
                 GSHidePanel();
             else
                 GSShowPanel();
         }
-        gFabMovedThisGesture = NO;
+        gFabMoved = NO;
     }
-}
-- (void)onFab {
-    // 保留接口；实际由 onPan 轻点触发
-    if (gPanel && !gPanel.hidden)
-        GSHidePanel();
-    else
-        GSShowPanel();
 }
 - (void)onClosePanel {
     GSHidePanel();
@@ -1175,7 +1063,7 @@ static void GSEnsureUI(void) {
 - (void)onCopyTitle {
     GSScanA11yTitle();
     if (!GSLooksLikeTitle(gTitleBest)) GSOcrTopTitle();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
                      GSRecomputeBestTitle();
                      if (gTitleBest.length) {
@@ -1195,28 +1083,26 @@ static void GSEnsureUI(void) {
     GSToast(@"已复制URL");
 }
 - (void)onPushNAS {
-    GSScanA11yTitle();
     GSPushToNAS();
 }
 - (void)onTick {
-    GSInstallHooks();
-    GSEnsureUI();
-    if (gLastAV) GSSampleAV(gLastAV);
-    if (gLastIJK) GSSampleIJK(gLastIJK);
-    if (gURL.length || gLastAV || gLastIJK) {
-        GSScanA11yTitle();
-        if (!GSLooksLikeTitle(gTitleBest)) GSOcrTopTitle();
-        if (gURL.length) GSFetchM3U8TitleIfNeeded(gURL);
+    @try {
+        GSInstallHooks();
+        GSEnsureFab();
+        if (gLastAV) GSSampleAV(gLastAV);
+        if (gLastIJK) GSSampleIJK(gLastIJK);
+        if (gURL.length || gLastAV || gLastIJK) {
+            GSScanA11yTitle();
+            if (!GSLooksLikeTitle(gTitleBest)) GSOcrTopTitle();
+            if (gURL.length && !gInOurNetwork) GSFetchM3U8TitleIfNeeded(gURL);
+        }
+        // 清掉错误技术串
+        if (gTitleJSON.length && GSIsTechIdentifier(gTitleJSON)) gTitleJSON = @"";
+        if (gTitleBest.length && GSIsTechIdentifier(gTitleBest)) gTitleBest = @"";
+        GSRecomputeBestTitle();
+        if (gPanel && !gPanel.hidden) GSRefreshPanelLabels();
+    } @catch (__unused NSException *e) {
     }
-    // 清掉错误的旧标题（技术串）
-    if (gTitleBest.length && GSIsTechIdentifier(gTitleBest)) {
-        gTitleBest = @"";
-        gTitleJSON = GSLooksLikeTitle(gTitleJSON) ? gTitleJSON : @"";
-    }
-    if (gTitleJSON.length && GSIsTechIdentifier(gTitleJSON)) gTitleJSON = @"";
-    GSRecomputeBestTitle();
-    GSUpdateDebugBar();
-    if (gPanel && !gPanel.hidden) GSRefreshPanelLabels();
 }
 - (void)onIJKNote:(NSNotification *)n {
     GSSampleIJK(n.object);
@@ -1227,7 +1113,7 @@ static void GSEnsureUI(void) {
 
 static void GSBoot(void) {
     GSInstallHooks();
-    GSEnsureUI();
+    GSEnsureFab();
     GSPlayerInfoTapTarget *t = [GSPlayerInfoTapTarget shared];
     NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
     [nc addObserver:t selector:@selector(onTick) name:UIApplicationDidBecomeActiveNotification object:nil];
@@ -1235,7 +1121,11 @@ static void GSBoot(void) {
             selector:@selector(onIJKNote:)
                 name:@"IJKMPMovieNaturalSizeAvailableNotification"
               object:nil];
-    [NSTimer scheduledTimerWithTimeInterval:1.0 target:t selector:@selector(onTick) userInfo:nil repeats:YES];
+    [NSTimer scheduledTimerWithTimeInterval:1.2
+                                     target:t
+                                   selector:@selector(onTick)
+                                   userInfo:nil
+                                    repeats:YES];
 }
 
 __attribute__((constructor)) static void GSPlayerInfoInit(void) {
@@ -1243,11 +1133,11 @@ __attribute__((constructor)) static void GSPlayerInfoInit(void) {
         GSBoot();
     else
         dispatch_async(dispatch_get_main_queue(), ^{ GSBoot(); });
-    for (int i = 1; i <= 5; i++) {
+    for (int i = 1; i <= 4; i++) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
                          GSInstallHooks();
-                         GSEnsureUI();
+                         GSEnsureFab();
                        });
     }
 }
