@@ -10,6 +10,11 @@
 TARGET := iphone:clang:latest:14.0
 ARCHS = arm64
 
+# 若本机没有 ldid，可改用 ad-hoc codesign（注入后仍需用你的证书重签）:
+#   export TARGET_CODESIGN=codesign
+#   export TARGET_CODESIGN_FLAGS="-f -s -"
+#   make clean all
+
 include $(THEOS)/makefiles/common.mk
 
 LIBRARY_NAME = GSPlayerInfo
