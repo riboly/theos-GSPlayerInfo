@@ -1,5 +1,5 @@
-# 在 GitHub 上用 macOS + Theos 编译可用的 iOS arm64 dylib
-# 用法：把本目录推到 GitHub 仓库，Actions 跑完后下载 Artifacts 里的 GSPlayerInfo.dylib
+# 在 GitHub macOS 上用 Theos 编译 arm64 iOS dylib
+# 编完后从 Artifacts 下载 GSPlayerInfo.dylib
 name: build-dylib
 
 on:
@@ -13,30 +13,86 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Theos
+      - name: Setup Theos + ldid
         run: |
-          set -e
-          git clone --recursive https://github.com/theos/theos.git $HOME/theos
-          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
-          # SDK: theos-sdks or Xcode
-          cd $HOME/theos
-          # use Xcode iPhoneOS SDK
-          ls $(xcrun --sdk iphoneos --show-sdk-path)
+          set -euo pipefail
+
+          # Theos
+          git clone --depth=1 --recursive https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+          echo "$HOME/theos/bin" >> "$GITHUB_PATH"
+
+          # ldid（Theos 签名步骤需要；没有会 Error 127）
+          if ! command -v ldid >/dev/null 2>&1; then
+            echo "==> Installing ldid via Homebrew..."
+            brew install ldid || true
+          fi
+
+          if ! command -v ldid >/dev/null 2>&1; then
+            echo "==> Homebrew failed, downloading Procursus ldid..."
+            mkdir -p "$HOME/bin"
+            # macOS arm64 runner
+            curl -L --fail -o "$HOME/bin/ldid" \
+              "https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_macosx_arm64" \
+              || curl -L --fail -o "$HOME/bin/ldid" \
+              "https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_macosx_x86_64" \
+              || true
+            if [ -f "$HOME/bin/ldid" ]; then
+              chmod +x "$HOME/bin/ldid"
+              echo "$HOME/bin" >> "$GITHUB_PATH"
+            fi
+          fi
+
+          # 仍没有 ldid 时，用 ad-hoc codesign 顶替（注入后你还会重签）
+          if ! command -v ldid >/dev/null 2>&1; then
+            echo "==> ldid still missing; will use codesign -s -"
+            echo "TARGET_CODESIGN=codesign" >> "$GITHUB_ENV"
+            echo "TARGET_CODESIGN_FLAGS=-f -s -" >> "$GITHUB_ENV"
+          else
+            echo "==> ldid: $(command -v ldid)"
+            ldid 2>&1 | head -3 || true
+          fi
+
+          echo "==> iPhoneOS SDK:"
+          xcrun --sdk iphoneos --show-sdk-path
 
       - name: Build
         run: |
-          set -e
-          export THEOS=$HOME/theos
-          make clean all
-          find .theos -name '*.dylib' -ls || true
+          set -euo pipefail
+          export THEOS="${THEOS:-$HOME/theos}"
+          export PATH="$HOME/bin:$THEOS/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+          # 若只有 codesign 回退
+          if [ -n "${TARGET_CODESIGN:-}" ]; then
+            export TARGET_CODESIGN
+            export TARGET_CODESIGN_FLAGS
+            echo "Using TARGET_CODESIGN=$TARGET_CODESIGN $TARGET_CODESIGN_FLAGS"
+          fi
+
+          make clean all FINALPACKAGE=1
+
           mkdir -p packages
-          DY=$(find .theos/obj -name 'GSPlayerInfo.dylib' | head -1)
+          DY="$(find .theos/obj -name 'GSPlayerInfo.dylib' | head -1)"
+          echo "found: $DY"
           test -n "$DY"
           cp -f "$DY" packages/GSPlayerInfo.dylib
-          # install_name 改成与 flex 一致的注入路径
-          install_name_tool -id @executable_path/GSPlayerInfo.dylib packages/GSPlayerInfo.dylib || true
+
+          # 注入路径与 flex 一致
+          install_name_tool -id '@executable_path/GSPlayerInfo.dylib' packages/GSPlayerInfo.dylib
+
+          # 再签一次，避免 install_name_tool 破坏签名
+          if command -v ldid >/dev/null 2>&1; then
+            ldid -S packages/GSPlayerInfo.dylib || true
+          else
+            codesign -f -s - packages/GSPlayerInfo.dylib || true
+          fi
+
+          echo "==> lipo:"
           lipo -info packages/GSPlayerInfo.dylib || true
+          echo "==> otool -L:"
           otool -L packages/GSPlayerInfo.dylib | head -40
+          echo "==> file:"
+          file packages/GSPlayerInfo.dylib
           ls -la packages/
 
       - name: Upload dylib
