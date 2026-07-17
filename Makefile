@@ -15,7 +15,7 @@ include $(THEOS)/makefiles/common.mk
 LIBRARY_NAME = GSPlayerInfo
 
 GSPlayerInfo_FILES = Tweak.m
-GSPlayerInfo_CFLAGS = -fobjc-arc -Wno-unused-variable -Wno-deprecated-declarations
+GSPlayerInfo_CFLAGS += -Wno-arc-retain-cycles
 GSPlayerInfo_FRAMEWORKS = UIKit Foundation AVFoundation CoreGraphics QuartzCore
 GSPlayerInfo_INSTALL_PATH = /usr/local/lib
 
