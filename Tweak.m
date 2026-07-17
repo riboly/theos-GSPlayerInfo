@@ -878,10 +878,8 @@ static id h_json(id s, SEL c, id data, NSUInteger opt, NSError **err) {
 // flutter_des: handleMethodCall — 解密结果在 result 回调
 static void h_des_handle(id s, SEL c, id call, id result) {
     NSString *method = nil;
-    id args = nil;
     @try {
         method = [call valueForKey:@"method"];
-        args = [call valueForKey:@"arguments"];
     } @catch (__unused NSException *e) {
     }
 
@@ -961,11 +959,14 @@ static void GSInstallHooks(void) {
         }
     }
     // flutter_des ObjC + Swift 插件
-    Class des1 = NSClassFromString(@"FlutterDesPlugin");
-    Class des2 = NSClassFromString(@"SwiftFlutterDesPlugin");
-    Class des3 = NSClassFromString(@"_TtC11flutter_des21SwiftFlutterDesPlugin");
-    for (Class des in @[ des1 ?: [NSNull null], des2 ?: [NSNull null], des3 ?: [NSNull null] ]) {
-        if ((id)des == [NSNull null] || !des) continue;
+    Class desClasses[] = {
+        NSClassFromString(@"FlutterDesPlugin"),
+        NSClassFromString(@"SwiftFlutterDesPlugin"),
+        NSClassFromString(@"_TtC11flutter_des21SwiftFlutterDesPlugin"),
+    };
+    for (size_t i = 0; i < sizeof(desClasses) / sizeof(desClasses[0]); i++) {
+        Class des = desClasses[i];
+        if (!des) continue;
         GSSwizzleInst(des, @selector(handleMethodCall:result:), (IMP)h_des_handle, &o_des_handle);
         if (o_des_handle) break;
     }
