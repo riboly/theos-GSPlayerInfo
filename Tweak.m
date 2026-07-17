@@ -150,37 +150,40 @@ static void GSHookAVReplace(id self, SEL _cmd, id item) {
     ((void(*)(id, SEL, id))GSOrigAVReplace)(self, _cmd, item);
     if ([self isKindOfClass:[AVPlayer class]]) GSSampleAV((AVPlayer *)self);
 }
+static void GSScanJSONObject(id o, int depth) {
+    if (!o || depth > 4) return;
+    if ([o isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *d = (NSDictionary *)o;
+        for (NSString *k in @[@"playUrl", @"play_url", @"videoUrl", @"url", @"urlM3u8", @"m3u8"]) {
+            id v = d[k];
+            if ([v isKindOfClass:[NSString class]] &&
+                ([(NSString *)v containsString:@"http"] || [(NSString *)v containsString:@"m3u8"])) {
+                gURL = v;
+                break;
+            }
+        }
+        for (NSString *k in @[@"video_name", @"title", @"name"]) {
+            id v = d[k];
+            if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0) {
+                gTitle = v;
+                break;
+            }
+        }
+        for (id v in d.allValues) {
+            GSScanJSONObject(v, depth + 1);
+        }
+    } else if ([o isKindOfClass:[NSArray class]]) {
+        for (id v in (NSArray *)o) {
+            GSScanJSONObject(v, depth + 1);
+        }
+    }
+}
+
 static id GSHookJSON(id self, SEL _cmd, id data, NSUInteger opt, NSError **err) {
     id obj = ((id(*)(id, SEL, id, NSUInteger, NSError **))GSOrigJSON)(self, _cmd, data, opt, err);
-    if (![obj isKindOfClass:[NSDictionary class]] && ![obj isKindOfClass:[NSArray class]]) return obj;
-    // shallow scan
-    void (^scan)(id, int);
-    __block void (^bscan)(id, int);
-    bscan = ^(id o, int depth) {
-        if (!o || depth > 4) return;
-        if ([o isKindOfClass:[NSDictionary class]]) {
-            NSDictionary *d = o;
-            for (NSString *k in @[@"playUrl", @"play_url", @"videoUrl", @"url", @"urlM3u8", @"m3u8"]) {
-                id v = d[k];
-                if ([v isKindOfClass:[NSString class]] &&
-                    ([(NSString *)v containsString:@"http"] || [(NSString *)v containsString:@"m3u8"])) {
-                    gURL = v;
-                    break;
-                }
-            }
-            for (NSString *k in @[@"video_name", @"title", @"name"]) {
-                id v = d[k];
-                if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0) {
-                    gTitle = v;
-                    break;
-                }
-            }
-            for (id v in d.allValues) bscan(v, depth + 1);
-        } else if ([o isKindOfClass:[NSArray class]]) {
-            for (id v in (NSArray *)o) bscan(v, depth + 1);
-        }
-    };
-    bscan(obj, 0);
+    if ([obj isKindOfClass:[NSDictionary class]] || [obj isKindOfClass:[NSArray class]]) {
+        GSScanJSONObject(obj, 0);
+    }
     return obj;
 }
 
