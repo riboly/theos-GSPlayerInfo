@@ -144,11 +144,6 @@ static NSString *GSResText(void) {
     return @"(未获取)";
 }
 
-static NSString *GSCopyTitleURL(void) {
-    return [NSString stringWithFormat:@"%@----%@", gTitle.length ? gTitle : @"(无标题)",
-                                      gURL.length ? gURL : @"(无URL)"];
-}
-
 static void GSToast(NSString *msg) {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIWindow *win = GSKeyWindow();
@@ -187,16 +182,6 @@ static UIWindow *GSKeyWindow(void) {
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     return app.keyWindow ?: app.windows.firstObject;
 #pragma clang diagnostic pop
-}
-
-static UIViewController *GSTopVC(void) {
-    UIViewController *vc = GSKeyWindow().rootViewController;
-    while (vc.presentedViewController) vc = vc.presentedViewController;
-    if ([vc isKindOfClass:[UINavigationController class]])
-        vc = ((UINavigationController *)vc).visibleViewController ?: vc;
-    if ([vc isKindOfClass:[UITabBarController class]])
-        vc = ((UITabBarController *)vc).selectedViewController ?: vc;
-    return vc;
 }
 
 #pragma mark - JSON title (关键：display_title / video_title / mv_title)
