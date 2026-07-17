@@ -1,0 +1,46 @@
+# 在 GitHub 上用 macOS + Theos 编译可用的 iOS arm64 dylib
+# 用法：把本目录推到 GitHub 仓库，Actions 跑完后下载 Artifacts 里的 GSPlayerInfo.dylib
+name: build-dylib
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Theos
+        run: |
+          set -e
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          # SDK: theos-sdks or Xcode
+          cd $HOME/theos
+          # use Xcode iPhoneOS SDK
+          ls $(xcrun --sdk iphoneos --show-sdk-path)
+
+      - name: Build
+        run: |
+          set -e
+          export THEOS=$HOME/theos
+          make clean all
+          find .theos -name '*.dylib' -ls || true
+          mkdir -p packages
+          DY=$(find .theos/obj -name 'GSPlayerInfo.dylib' | head -1)
+          test -n "$DY"
+          cp -f "$DY" packages/GSPlayerInfo.dylib
+          # install_name 改成与 flex 一致的注入路径
+          install_name_tool -id @executable_path/GSPlayerInfo.dylib packages/GSPlayerInfo.dylib || true
+          lipo -info packages/GSPlayerInfo.dylib || true
+          otool -L packages/GSPlayerInfo.dylib | head -40
+          ls -la packages/
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: GSPlayerInfo-dylib
+          path: packages/GSPlayerInfo.dylib
