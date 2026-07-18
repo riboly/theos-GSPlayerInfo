@@ -1,0 +1,923 @@
+﻿/*
+ * GSPlayerInfo
+ * 标题主路径：强制 Flutter Semantics（fishhook VoiceOver）→ A11y 读顶栏文案
+ * 副路径：flutter_des 解密明文 JSON / 打开面板 OCR
+ * 标题可手动切换来源；URL/分辨率保持原稳定 hook
+ * NAS: POST http://192.168.6.110:38617/api/download
+ */
+
+#import <UIKit/UIKit.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
+#import <AVFoundation/AVFoundation.h>
+#import <Vision/Vision.h>
+#import <dlfcn.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <mach-o/nlist.h>
+#import <string.h>
+#import <stdlib.h>
+
+static NSString *const kGSNASDownloadURL = @"http://192.168.6.110:38617/api/download";
+
+#pragma mark - Title sources
+
+typedef NS_ENUM(NSInteger, GSTitleSrc) {
+    GSTitleSrcNone = -1,
+    GSTitleSrcA11y = 0,
+    GSTitleSrcDES = 1,
+    GSTitleSrcJSON = 2,
+    GSTitleSrcOCR = 3,
+    GSTitleSrcAVMeta = 4,
+    GSTitleSrcM3U8 = 5,
+    GSTitleSrcCount = 6,
+};
+
+static NSString *gTitleBySrc[GSTitleSrcCount];
+static GSTitleSrc gTitlePick = GSTitleSrcNone; // 用户手动选择；None=自动
+static NSString *gURL = @"";
+static NSString *gExtra = @"";
+static NSInteger gW = 0, gH = 0;
+static BOOL gHooksOK = NO;
+static BOOL gVoiceOverHooked = NO;
+
+static UIButton *gBtn = nil;
+static UIView *gPanel = nil;
+static UILabel *gLabRes = nil, *gLabTitle = nil, *gLabURL = nil, *gLabDebug = nil;
+static UIScrollView *gSrcScroll = nil;
+static UIView *gSrcBox = nil;
+static UIButton *gBtnNas = nil;
+static NSMutableArray<UIButton *> *gSrcBtns;
+static id gLastIJK = nil;
+static AVPlayer *gLastAV = nil;
+static NSTimeInterval gLastOCR = 0, gLastM3U8 = 0;
+static NSString *gLastM3U8URL = @"";
+static CGPoint gFabOffset = {0, 0};
+static BOOL gFabMoved = NO;
+static volatile BOOL gInOurNetwork = NO;
+
+#pragma mark - String helpers
+
+static BOOL GSHasCJK(NSString *s) {
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar c = [s characterAtIndex:i];
+        if ((c >= 0x4E00 && c <= 0x9FFF) || (c >= 0x3040 && c <= 0x30FF) ||
+            (c >= 0x3000 && c <= 0x303F) || c == 0x30FB)
+            return YES;
+    }
+    return NO;
+}
+
+static BOOL GSIsTechIdentifier(NSString *t) {
+    if (t.length == 0) return YES;
+    NSString *l = t.lowercaseString;
+    if ([l rangeOfString:@"^[a-z][a-z0-9_]*$" options:NSRegularExpressionSearch].location != NSNotFound &&
+        [l containsString:@"_"])
+        return YES;
+    NSArray *bad = @[
+        @"hierarchical", @"inner_product", @"tensor", @"embedding", @"layer", @"model", @"softmax",
+        @"flutter", @"dart", @"null", @"undefined", @"object", @"true", @"false", @"loading"
+    ];
+    for (NSString *b in bad)
+        if ([l containsString:b]) return YES;
+    return NO;
+}
+
+static BOOL GSLooksLikeTitle(NSString *t) {
+    if (t.length < 2 || t.length > 150) return NO;
+    t = [t stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (t.length < 2) return NO;
+    if ([t hasPrefix:@"http"] || [t containsString:@"m3u8"] || [t containsString:@".mp4"]) return NO;
+    if (GSIsTechIdentifier(t)) return NO;
+    NSArray *noise = @[
+        @"关闭", @"复制", @"播放信息", @"分辨率", @"视频标题", @"视频URL", @"推送到", @"NAS", @"调试",
+        @"1.0X", @"全屏", @"倍速", @"i", @"选用", @"自动", @"JSON", @"OCR", @"A11y", @"DES", @"M3U8",
+        @"AVMeta", @"未获取", @"hooks", @"返回", @"分享", @"选集", @"线路"
+    ];
+    for (NSString *b in noise)
+        if ([t isEqualToString:b]) return NO;
+    if ([t rangeOfString:@"^\\d{1,2}:\\d{2}(:\\d{2})?$" options:NSRegularExpressionSearch].location !=
+        NSNotFound)
+        return NO;
+    return GSHasCJK(t);
+}
+
+static BOOL GSIsNoiseHost(NSString *u) {
+    NSString *l = u.lowercaseString;
+    return [l containsString:@"umeng"] || [l containsString:@"apple.com"] ||
+           [l containsString:@"firebase"] || [l containsString:@"googleapis"] ||
+           [l containsString:@"crashlytics"] || [l containsString:@"sentry"] ||
+           [l containsString:@"bugly"] || [l containsString:@"icloud"];
+}
+
+static BOOL GSLooksMediaURL(NSString *u) {
+    if (u.length < 8 || GSIsNoiseHost(u)) return NO;
+    NSString *l = u.lowercaseString;
+    if (!([l hasPrefix:@"http://"] || [l hasPrefix:@"https://"])) return NO;
+    return [l containsString:@"m3u8"] || [l containsString:@".mp4"] || [l containsString:@"/hls/"] ||
+           [l containsString:@"/h5/m3u8"] || [l containsString:@"film_m3u8"] ||
+           [l containsString:@"getvideourl"] || [l containsString:@"play_url"] ||
+           [l containsString:@"playlist"] || [l containsString:@".flv"];
+}
+
+static NSString *GSSrcName(GSTitleSrc s) {
+    switch (s) {
+        case GSTitleSrcA11y: return @"A11y(语义/无障碍)";
+        case GSTitleSrcDES: return @"DES解密";
+        case GSTitleSrcJSON: return @"JSON";
+        case GSTitleSrcOCR: return @"OCR顶栏";
+        case GSTitleSrcAVMeta: return @"AVMeta";
+        case GSTitleSrcM3U8: return @"M3U8";
+        default: return @"?";
+    }
+}
+
+static NSString *GSBestTitleAuto(void) {
+    // 优先级：A11y(强制语义后最准) > DES > JSON > OCR > AVMeta > M3U8
+    GSTitleSrc order[] = {GSTitleSrcA11y, GSTitleSrcDES, GSTitleSrcJSON, GSTitleSrcOCR,
+                          GSTitleSrcAVMeta, GSTitleSrcM3U8};
+    for (int i = 0; i < 6; i++) {
+        NSString *t = gTitleBySrc[order[i]];
+        if (GSLooksLikeTitle(t)) return t;
+    }
+    return @"";
+}
+
+static NSString *GSEffectiveTitle(void) {
+    if (gTitlePick >= 0 && gTitlePick < GSTitleSrcCount) {
+        NSString *t = gTitleBySrc[gTitlePick];
+        if (GSLooksLikeTitle(t)) return t;
+    }
+    return GSBestTitleAuto();
+}
+
+static GSTitleSrc GSAutoPickSource(void) {
+    GSTitleSrc order[] = {GSTitleSrcA11y, GSTitleSrcDES, GSTitleSrcJSON, GSTitleSrcOCR,
+                          GSTitleSrcAVMeta, GSTitleSrcM3U8};
+    for (int i = 0; i < 6; i++) {
+        if (GSLooksLikeTitle(gTitleBySrc[order[i]])) return order[i];
+    }
+    return GSTitleSrcNone;
+}
+
+static void GSSetTitle(NSString *t, GSTitleSrc src) {
+    if (!GSLooksLikeTitle(t) || src < 0 || src >= GSTitleSrcCount) return;
+    t = [t stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    // 同来源保留更长中文
+    NSString *old = gTitleBySrc[src];
+    if (old.length && GSLooksLikeTitle(old) && old.length > t.length && [old containsString:t])
+        return;
+    gTitleBySrc[src] = [t copy];
+}
+
+static void GSRememberURL(NSString *u, NSString *source) {
+    if (u.length == 0 || GSIsNoiseHost(u)) return;
+    BOOL ok = GSLooksMediaURL(u) || [source hasPrefix:@"AV"] || [source hasPrefix:@"IJK"] ||
+              [source hasPrefix:@"FVP"] || [source isEqualToString:@"JSON"];
+    if (!ok) return;
+    gURL = [u copy];
+    if (source.length) gExtra = [source copy];
+}
+
+static void GSRememberSize(CGFloat w, CGFloat h) {
+    if (w > 1 && h > 1 && w < 10000 && h < 10000) {
+        gW = (NSInteger)(w + 0.5);
+        gH = (NSInteger)(h + 0.5);
+    }
+}
+
+static NSString *GSResText(void) {
+    return (gW > 0 && gH > 0) ? [NSString stringWithFormat:@"%ldx%ld", (long)gW, (long)gH] : @"(未获取)";
+}
+
+static NSString *GSDash(NSString *s) {
+    if (!s.length) return @"-";
+    if (s.length > 36) return [[s substringToIndex:36] stringByAppendingString:@"…"];
+    return s;
+}
+
+static UIWindow *GSKeyWindow(void) {
+    UIApplication *app = UIApplication.sharedApplication;
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in app.connectedScenes) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in ((UIWindowScene *)scene).windows)
+                if (w.isKeyWindow) return w;
+            if (((UIWindowScene *)scene).windows.count)
+                return ((UIWindowScene *)scene).windows.firstObject;
+        }
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    return app.keyWindow ?: app.windows.firstObject;
+#pragma clang diagnostic pop
+}
+
+static void GSToast(NSString *msg) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      UIWindow *win = GSKeyWindow();
+      if (!win) return;
+      UILabel *lab = [[UILabel alloc]
+          initWithFrame:CGRectMake(40, win.bounds.size.height * 0.4, win.bounds.size.width - 80, 40)];
+      lab.text = msg;
+      lab.textAlignment = NSTextAlignmentCenter;
+      lab.textColor = UIColor.whiteColor;
+      lab.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.78];
+      lab.font = [UIFont systemFontOfSize:14];
+      lab.layer.cornerRadius = 8;
+      lab.clipsToBounds = YES;
+      [win addSubview:lab];
+      [UIView animateWithDuration:0.25 delay:1.2 options:0 animations:^{ lab.alpha = 0; } completion:^(BOOL f) {
+        [lab removeFromSuperview];
+      }];
+    });
+}
+
+static void GSRefreshPanelLabels(void);
+
+#pragma mark - fishhook: 强制 Flutter 打开 Semantics
+
+// 精简 fishhook：重绑指定镜像对某符号的导入指针
+static int GSRebindSymbolInImage(const struct mach_header *header, intptr_t slide, const char *symbol,
+                                 void *replacement, void **replaced_out) {
+    if (header->magic != MH_MAGIC_64) return -1;
+    const struct mach_header_64 *hdr = (const struct mach_header_64 *)header;
+    const uint8_t *base = (const uint8_t *)header;
+    const struct load_command *lc = (const struct load_command *)(base + sizeof(struct mach_header_64));
+
+    const struct segment_command_64 *linkedit = NULL;
+    const struct segment_command_64 *data_seg = NULL;
+    const struct dysymtab_command *dysym = NULL;
+    const struct symtab_command *symtab = NULL;
+
+    for (uint32_t i = 0; i < hdr->ncmds; i++) {
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            if (strcmp(seg->segname, SEG_LINKEDIT) == 0) linkedit = seg;
+            // 多个 DATA 段
+        } else if (lc->cmd == LC_SYMTAB) {
+            symtab = (const struct symtab_command *)lc;
+        } else if (lc->cmd == LC_DYSYMTAB) {
+            dysym = (const struct dysymtab_command *)lc;
+        }
+        lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize);
+    }
+    if (!linkedit || !symtab || !dysym) return -1;
+
+    // 再扫一遍找 lazy/non-lazy pointer sections
+    lc = (const struct load_command *)(base + sizeof(struct mach_header_64));
+    uintptr_t linkedit_base = (uintptr_t)slide + linkedit->vmaddr - linkedit->fileoff;
+    const struct nlist_64 *symtab_ptr =
+        (const struct nlist_64 *)(linkedit_base + symtab->symoff);
+    const char *strtab = (const char *)(linkedit_base + symtab->stroff);
+    const uint32_t *indirect = (const uint32_t *)(linkedit_base + dysym->indirectsymoff);
+
+    int found = 0;
+    lc = (const struct load_command *)(base + sizeof(struct mach_header_64));
+    for (uint32_t i = 0; i < hdr->ncmds; i++) {
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            const struct section_64 *sec = (const struct section_64 *)(seg + 1);
+            for (uint32_t j = 0; j < seg->nsects; j++, sec++) {
+                uint32_t type = sec->flags & SECTION_TYPE;
+                if (type != S_LAZY_SYMBOL_POINTERS && type != S_NON_LAZY_SYMBOL_POINTERS) continue;
+                uint32_t count = (uint32_t)(sec->size / sizeof(void *));
+                void **indirect_sym =
+                    (void **)((uintptr_t)slide + sec->addr);
+                uint32_t idx0 = sec->reserved1;
+                for (uint32_t k = 0; k < count; k++) {
+                    uint32_t symIndex = indirect[idx0 + k];
+                    if (symIndex == INDIRECT_SYMBOL_ABS || symIndex == INDIRECT_SYMBOL_LOCAL ||
+                        symIndex == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS))
+                        continue;
+                    if (symIndex >= symtab->nsyms) continue;
+                    const struct nlist_64 *nl = &symtab_ptr[symIndex];
+                    const char *name = strtab + nl->n_un.n_strx;
+                    if (name[0] == '_') name++;
+                    if (strcmp(name, symbol) != 0) continue;
+                    if (replaced_out && !*replaced_out && indirect_sym[k])
+                        *replaced_out = indirect_sym[k];
+                    // 写入新指针
+                    indirect_sym[k] = replacement;
+                    found = 1;
+                }
+            }
+        }
+        lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize);
+    }
+    return found ? 0 : -1;
+}
+
+static BOOL (*orig_UIAccessibilityIsVoiceOverRunning)(void) = NULL;
+static BOOL fake_UIAccessibilityIsVoiceOverRunning(void) { return YES; }
+
+static void GSForceFlutterSemantics(void) {
+    if (gVoiceOverHooked) return;
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name) continue;
+        // 对主程序和 Flutter 都 rebind
+        if (strstr(name, "Flutter") || strstr(name, "byg") || strstr(name, "/App")) {
+            const struct mach_header *hdr = _dyld_get_image_header(i);
+            intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+            void *old = NULL;
+            if (GSRebindSymbolInImage(hdr, slide, "UIAccessibilityIsVoiceOverRunning",
+                                      (void *)fake_UIAccessibilityIsVoiceOverRunning, &old) == 0) {
+                if (old && !orig_UIAccessibilityIsVoiceOverRunning)
+                    orig_UIAccessibilityIsVoiceOverRunning = old;
+                gVoiceOverHooked = YES;
+            }
+        }
+    }
+    // 也 rebind 全局默认
+    void *old = NULL;
+    const struct mach_header *mh = _dyld_get_image_header(0);
+    GSRebindSymbolInImage(mh, _dyld_get_image_vmaddr_slide(0), "UIAccessibilityIsVoiceOverRunning",
+                          (void *)fake_UIAccessibilityIsVoiceOverRunning, &old);
+    if (old && !orig_UIAccessibilityIsVoiceOverRunning)
+        orig_UIAccessibilityIsVoiceOverRunning = old;
+
+    // 通知无障碍状态变化，促使 Flutter 建语义树
+    dispatch_async(dispatch_get_main_queue(), ^{
+      UIAccessibilityPostNotification(UIAccessibilityScreenChangedNotification, nil);
+      // 再发一次 layout
+      UIAccessibilityPostNotification(UIAccessibilityLayoutChangedNotification, nil);
+    });
+}
+
+#pragma mark - A11y scan (after semantics)
+
+static void GSWalkA11y(id node, int depth, CGFloat screenH, NSMutableArray *out) {
+    if (!node || depth > 24) return;
+
+    NSString *lab = nil;
+    CGFloat midY = 0;
+    @try {
+        if ([node respondsToSelector:@selector(accessibilityLabel)])
+            lab = [node accessibilityLabel];
+        if ([node respondsToSelector:@selector(accessibilityValue)]) {
+            id v = [node accessibilityValue];
+            if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > (lab.length ?: 0))
+                lab = v;
+        }
+        if ([node respondsToSelector:@selector(accessibilityFrame)]) {
+            CGRect f = [node accessibilityFrame];
+            if (!CGRectIsEmpty(f)) midY = CGRectGetMidY(f);
+        }
+    } @catch (__unused NSException *e) {
+    }
+
+    if (GSLooksLikeTitle(lab)) {
+        // 优先上半屏
+        if (screenH <= 0 || midY < 1 || midY < screenH * 0.55)
+            [out addObject:@{@"t" : lab, @"y" : @(midY > 0 ? midY : 0), @"len" : @(lab.length)}];
+    }
+
+    // UIView 子树
+    if ([node isKindOfClass:[UIView class]]) {
+        UIView *view = (UIView *)node;
+        if (view.hidden || view.alpha < 0.02) return;
+        if (view == gBtn || view == gPanel) return;
+        if ([view isKindOfClass:[UILabel class]]) {
+            NSString *t = ((UILabel *)view).text;
+            CGRect fr = [view convertRect:view.bounds toView:nil];
+            if (GSLooksLikeTitle(t))
+                [out addObject:@{
+                    @"t" : t,
+                    @"y" : @(CGRectGetMidY(fr)),
+                    @"len" : @(t.length)
+                }];
+        }
+        NSArray *els = nil;
+        @try {
+            if (!view.isAccessibilityElement) els = view.accessibilityElements;
+        } @catch (__unused NSException *e) {
+        }
+        if ([els isKindOfClass:[NSArray class]]) {
+            for (id el in els) GSWalkA11y(el, depth + 1, screenH, out);
+        }
+        for (UIView *sub in view.subviews) GSWalkA11y(sub, depth + 1, screenH, out);
+    }
+}
+
+static void GSScanA11yTitle(void) {
+    UIWindow *win = GSKeyWindow();
+    if (!win) return;
+    CGFloat H = win.bounds.size.height;
+    NSMutableArray *cands = [NSMutableArray array];
+    GSWalkA11y(win, 0, H, cands);
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in ((UIWindowScene *)sc).windows) {
+                if (w != win) GSWalkA11y(w, 0, H, cands);
+            }
+        }
+    }
+    if (!cands.count) return;
+    [cands sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+      CGFloat ya = [a[@"y"] doubleValue], yb = [b[@"y"] doubleValue];
+      if (ya > 1 && yb > 1) {
+          if (ya < yb - 10) return NSOrderedAscending;
+          if (yb < ya - 10) return NSOrderedDescending;
+      }
+      return [@([b[@"len"] integerValue]) compare:@([a[@"len"] integerValue])];
+    }];
+    for (NSDictionary *c in cands) {
+        if (GSLooksLikeTitle(c[@"t"])) {
+            GSSetTitle(c[@"t"], GSTitleSrcA11y);
+            return;
+        }
+    }
+}
+
+#pragma mark - OCR
+
+static void GSOcrTopTitle(void) {
+    NSTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (now - gLastOCR < 2.0) return;
+    gLastOCR = now;
+    UIWindow *win = GSKeyWindow();
+    if (!win) return;
+    CGFloat scale = UIScreen.mainScreen.scale;
+    CGFloat topInset = 0;
+    if (@available(iOS 11.0, *)) topInset = win.safeAreaInsets.top;
+    CGRect band = CGRectMake(48, topInset, MAX(80, win.bounds.size.width - 110), 50);
+    UIGraphicsBeginImageContextWithOptions(band.size, NO, scale);
+    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    if (!ctx) {
+        UIGraphicsEndImageContext();
+        return;
+    }
+    CGContextTranslateCTM(ctx, -band.origin.x, -band.origin.y);
+    [win drawViewHierarchyInRect:win.bounds afterScreenUpdates:NO];
+    UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    if (!img.CGImage) return;
+
+    VNImageRequestHandler *handler =
+        [[VNImageRequestHandler alloc] initWithCGImage:img.CGImage options:@{}];
+    VNRecognizeTextRequest *req =
+        [[VNRecognizeTextRequest alloc] initWithCompletionHandler:^(VNRequest *request, NSError *error) {
+          if (error || !request.results.count) return;
+          NSString *best = nil;
+          NSMutableString *join = [NSMutableString string];
+          for (VNRecognizedTextObservation *obs in request.results) {
+              NSString *s = [obs topCandidates:1].firstObject.string;
+              if (!s.length) continue;
+              [join appendString:s];
+              if (GSLooksLikeTitle(s) && (!best || s.length > best.length)) best = s;
+          }
+          if ((!best || best.length < 4) && GSLooksLikeTitle(join)) best = join;
+          if (best.length) {
+              dispatch_async(dispatch_get_main_queue(), ^{
+                GSSetTitle(best, GSTitleSrcOCR);
+                GSRefreshPanelLabels();
+              });
+          }
+        }];
+    req.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
+    req.usesLanguageCorrection = NO;
+    if (@available(iOS 14.0, *))
+        req.recognitionLanguages = @[ @"zh-Hans", @"zh-Hant", @"ja", @"en" ];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+      @try {
+          [handler performRequests:@[ req ] error:nil];
+      } @catch (__unused NSException *e) {
+      }
+    });
+}
+
+#pragma mark - Parse title from plaintext JSON string
+
+static void GSIngestPlaintextMaybeJSON(NSString *text, GSTitleSrc src) {
+    if (text.length < 4) return;
+    // 尝试整段 JSON
+    NSData *d = [text dataUsingEncoding:NSUTF8StringEncoding];
+    if (d) {
+        id obj = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+        if (obj) {
+            // 内联轻量扫描（避免依赖未定义函数顺序）
+            // 用递归 block 会 retain cycle — 用简单栈式
+            NSMutableArray *stack = [NSMutableArray arrayWithObject:obj];
+            static NSArray *tkeys;
+            static NSArray *ukeys;
+            static dispatch_once_t once;
+            dispatch_once(&once, ^{
+              tkeys = @[
+                  @"display_title", @"displayTitle", @"video_title", @"videoTitle", @"video_name",
+                  @"mv_title", @"mvTitle", @"play_title", @"playTitle", @"sp91_film_subject",
+                  @"sp91_small_video_subject", @"title"
+              ];
+              ukeys = @[
+                  @"playUrl", @"play_url", @"videoUrl", @"video_url", @"url", @"urlM3u8", @"m3u8",
+                  @"mv_play_url", @"link"
+              ];
+            });
+            int guard = 0;
+            while (stack.count && guard++ < 400) {
+                id cur = stack.lastObject;
+                [stack removeLastObject];
+                if ([cur isKindOfClass:[NSDictionary class]]) {
+                    NSDictionary *dict = cur;
+                    for (NSString *k in ukeys) {
+                        id v = dict[k];
+                        if ([v isKindOfClass:[NSString class]] && GSLooksMediaURL(v))
+                            GSRememberURL(v, @"JSON");
+                    }
+                    for (NSString *k in tkeys) {
+                        id v = dict[k];
+                        if ([v isKindOfClass:[NSString class]] && GSLooksLikeTitle(v)) {
+                            // title 弱键要求更长
+                            if ([k isEqualToString:@"title"] && [(NSString *)v length] < 4) continue;
+                            GSSetTitle(v, src);
+                        }
+                    }
+                    for (id v in dict.allValues) {
+                        if ([v isKindOfClass:[NSDictionary class]] || [v isKindOfClass:[NSArray class]])
+                            [stack addObject:v];
+                    }
+                } else if ([cur isKindOfClass:[NSArray class]]) {
+                    for (id v in (NSArray *)cur) {
+                        if ([v isKindOfClass:[NSDictionary class]] || [v isKindOfClass:[NSArray class]])
+                            [stack addObject:v];
+                    }
+                }
+            }
+            return;
+        }
+    }
+    // 非完整 JSON：正则挖 "display_title":"..."
+    NSArray *keys = @[
+        @"display_title", @"video_title", @"video_name", @"mv_title", @"play_title", @"title"
+    ];
+    for (NSString *k in keys) {
+        NSString *pat =
+            [NSString stringWithFormat:@"\"%@\"\\s*[:=]\\s*\"([^\"]{2,120})\"", k];
+        NSRegularExpression *re =
+            [NSRegularExpression regularExpressionWithPattern:pat options:0 error:nil];
+        NSTextCheckingResult *m =
+            [re firstMatchInString:text options:0 range:NSMakeRange(0, MIN(text.length, (NSUInteger)50000))];
+        if (m.numberOfRanges > 1) {
+            NSString *t = [text substringWithRange:[m rangeAtIndex:1]];
+            if (GSLooksLikeTitle(t)) GSSetTitle(t, src);
+        }
+    }
+}
+
+#pragma mark - m3u8 / AVMeta (keep, low priority)
+
+static void GSParseM3U8(NSString *text) {
+    if (text.length < 10 || ![text containsString:@"#EXT"]) return;
+    NSUInteger lim = MIN(text.length, (NSUInteger)5000);
+    NSRegularExpression *re =
+        [NSRegularExpression regularExpressionWithPattern:@"#EXTINF:[^,]*,\\s*(.+)" options:0 error:nil];
+    NSTextCheckingResult *m = [re firstMatchInString:text options:0 range:NSMakeRange(0, lim)];
+    if (m.numberOfRanges > 1) {
+        NSString *t = [[text substringWithRange:[m rangeAtIndex:1]]
+            stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (GSLooksLikeTitle(t)) GSSetTitle(t, GSTitleSrcM3U8);
+    }
+}
+
+static void GSFetchM3U8(NSString *url) {
+    if (!url.length || ![url.lowercaseString containsString:@"m3u8"]) return;
+    if ([gLastM3U8URL isEqualToString:url] && gTitleBySrc[GSTitleSrcM3U8].length) return;
+    NSTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (now - gLastM3U8 < 4.0 && [gLastM3U8URL isEqualToString:url]) return;
+    gLastM3U8 = now;
+    gLastM3U8URL = [url copy];
+    NSURL *u = [NSURL URLWithString:url];
+    if (!u) return;
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:u];
+    req.timeoutInterval = 10;
+    gInOurNetwork = YES;
+    [[[NSURLSession sharedSession]
+        dataTaskWithRequest:req
+          completionHandler:^(NSData *data, NSURLResponse *r, NSError *e) {
+            gInOurNetwork = NO;
+            if (e || data.length < 8) return;
+            NSString *txt = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            if (txt) GSParseM3U8(txt);
+            dispatch_async(dispatch_get_main_queue(), ^{ GSRefreshPanelLabels(); });
+          }] resume];
+}
+
+static void GSLoadAVMeta(AVAsset *asset) {
+    if (!asset) return;
+    NSTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (now - gLastM3U8 < 0) {
+    } // silence unused if any
+    static NSTimeInterval last = 0;
+    if (CFAbsoluteTimeGetCurrent() - last < 2.0 && gTitleBySrc[GSTitleSrcAVMeta].length) return;
+    last = CFAbsoluteTimeGetCurrent();
+    @try {
+        for (AVMetadataItem *it in asset.commonMetadata) {
+            if (GSLooksLikeTitle(it.stringValue)) {
+                GSSetTitle(it.stringValue, GSTitleSrcAVMeta);
+                return;
+            }
+        }
+    } @catch (__unused NSException *e) {
+    }
+    [asset loadValuesAsynchronouslyForKeys:@[ @"commonMetadata" ] completionHandler:^{
+      @try {
+          NSArray *meta = [AVMetadataItem metadataItemsFromArray:asset.commonMetadata
+                                                         withKey:AVMetadataCommonKeyTitle
+                                                        keySpace:AVMetadataKeySpaceCommon];
+          for (AVMetadataItem *it in meta) {
+              if (GSLooksLikeTitle(it.stringValue)) {
+                  GSSetTitle(it.stringValue, GSTitleSrcAVMeta);
+                  dispatch_async(dispatch_get_main_queue(), ^{ GSRefreshPanelLabels(); });
+                  return;
+              }
+          }
+      } @catch (__unused NSException *e) {
+      }
+    }];
+}
+
+#pragma mark - Sample / URL hooks (stable)
+
+static void GSSampleAV(AVPlayer *player) {
+    if (!player) return;
+    gLastAV = player;
+    AVPlayerItem *item = player.currentItem;
+    if (!item) return;
+    @try {
+        CGSize s = item.presentationSize;
+        GSRememberSize(s.width, s.height);
+        AVAsset *asset = item.asset;
+        if ([asset isKindOfClass:[AVURLAsset class]]) {
+            NSString *u = ((AVURLAsset *)asset).URL.absoluteString;
+            if (u.length) {
+                GSRememberURL(u, @"AVPlayer");
+                if (!gInOurNetwork) GSFetchM3U8(u);
+            }
+        }
+        GSLoadAVMeta(asset);
+    } @catch (__unused NSException *e) {
+    }
+}
+
+static void GSSampleIJK(id ijk) {
+    if (!ijk) return;
+    gLastIJK = ijk;
+    @try {
+        NSValue *v = [ijk valueForKey:@"naturalSize"];
+        if ([v isKindOfClass:[NSValue class]]) {
+            CGSize s = v.CGSizeValue;
+            GSRememberSize(s.width, s.height);
+        }
+    } @catch (__unused NSException *e) {
+    }
+    gExtra = @"IJK";
+}
+
+static void GSSwizzleInst(Class cls, SEL sel, IMP neu, IMP *orig) {
+    if (!cls || !sel || !neu || !orig || *orig) return;
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    *orig = method_getImplementation(m);
+    method_setImplementation(m, neu);
+    gHooksOK = YES;
+}
+static void GSSwizzleClass(Class cls, SEL sel, IMP neu, IMP *orig) {
+    if (!cls || !sel || !neu || !orig || *orig) return;
+    Method m = class_getInstanceMethod(object_getClass((id)cls), sel);
+    if (!m) return;
+    *orig = method_getImplementation(m);
+    method_setImplementation(m, neu);
+    gHooksOK = YES;
+}
+
+static IMP o_ijk_s, o_ijk_so, o_ijk_u, o_ijk_uo, o_ijk_ds, o_ijk_prep;
+static IMP o_fvp_url, o_fvpt_url;
+static IMP o_av_replace, o_av_initURL, o_av_playerWithURL;
+static IMP o_item_initURL, o_item_withURL, o_asset_initURL, o_asset_withURL;
+static IMP o_sess_req, o_sess_url, o_json, o_des_handle;
+
+static id h_ijk_s(id s, SEL c, id u) {
+    if ([u isKindOfClass:[NSString class]]) {
+        GSRememberURL(u, @"IJK");
+        if (!gInOurNetwork) GSFetchM3U8(u);
+    }
+    id r = ((id(*)(id, SEL, id))o_ijk_s)(s, c, u);
+    GSSampleIJK(r ?: s);
+    return r;
+}
+static id h_ijk_so(id s, SEL c, id u, id o) {
+    if ([u isKindOfClass:[NSString class]]) {
+        GSRememberURL(u, @"IJK");
+        if (!gInOurNetwork) GSFetchM3U8(u);
+    }
+    id r = ((id(*)(id, SEL, id, id))o_ijk_so)(s, c, u, o);
+    GSSampleIJK(r ?: s);
+    return r;
+}
+static id h_ijk_u(id s, SEL c, id u) {
+    NSString *us = [u isKindOfClass:[NSURL class]] ? [(NSURL *)u absoluteString]
+                   : [u isKindOfClass:[NSString class]] ? u
+                                                        : nil;
+    if (us) {
+        GSRememberURL(us, @"IJK");
+        if (!gInOurNetwork) GSFetchM3U8(us);
+    }
+    id r = ((id(*)(id, SEL, id))o_ijk_u)(s, c, u);
+    GSSampleIJK(r ?: s);
+    return r;
+}
+static id h_ijk_uo(id s, SEL c, id u, id o) {
+    NSString *us = [u isKindOfClass:[NSURL class]] ? [(NSURL *)u absoluteString]
+                   : [u isKindOfClass:[NSString class]] ? u
+                                                        : nil;
+    if (us) {
+        GSRememberURL(us, @"IJK");
+        if (!gInOurNetwork) GSFetchM3U8(us);
+    }
+    id r = ((id(*)(id, SEL, id, id))o_ijk_uo)(s, c, u, o);
+    GSSampleIJK(r ?: s);
+    return r;
+}
+static void h_ijk_ds(id s, SEL c, id u) {
+    NSString *us = [u isKindOfClass:[NSURL class]] ? [(NSURL *)u absoluteString]
+                   : [u isKindOfClass:[NSString class]] ? u
+                                                        : nil;
+    if (us) {
+        GSRememberURL(us, @"IJK-ds");
+        if (!gInOurNetwork) GSFetchM3U8(us);
+    }
+    if (o_ijk_ds) ((void(*)(id, SEL, id))o_ijk_ds)(s, c, u);
+    GSSampleIJK(s);
+}
+static void h_ijk_prep(id s, SEL c) {
+    if (o_ijk_prep) ((void(*)(id, SEL))o_ijk_prep)(s, c);
+    GSSampleIJK(s);
+}
+static id h_fvp_url(id s, SEL c, id url, id h, id a, id r) {
+    NSString *us = [url isKindOfClass:[NSString class]]
+                       ? url
+                       : ([url isKindOfClass:[NSURL class]] ? [(NSURL *)url absoluteString] : nil);
+    if (us) {
+        GSRememberURL(us, @"FVP");
+        if (!gInOurNetwork) GSFetchM3U8(us);
+    }
+    id x = ((id(*)(id, SEL, id, id, id, id))o_fvp_url)(s, c, url, h, a, r);
+    @try {
+        id p = [x valueForKey:@"player"];
+        if ([p isKindOfClass:[AVPlayer class]]) GSSampleAV(p);
+    } @catch (__unused NSException *e) {
+    }
+    return x;
+}
+static id h_fvpt_url(id s, SEL c, id url, id fu, id dl, id h, id a, id r, id od) {
+    NSString *us = [url isKindOfClass:[NSString class]]
+                       ? url
+                       : ([url isKindOfClass:[NSURL class]] ? [(NSURL *)url absoluteString] : nil);
+    if (us) {
+        GSRememberURL(us, @"FVP-tex");
+        if (!gInOurNetwork) GSFetchM3U8(us);
+    }
+    id x = ((id(*)(id, SEL, id, id, id, id, id, id, id))o_fvpt_url)(s, c, url, fu, dl, h, a, r, od);
+    @try {
+        id p = [x valueForKey:@"player"];
+        if ([p isKindOfClass:[AVPlayer class]]) GSSampleAV(p);
+    } @catch (__unused NSException *e) {
+    }
+    return x;
+}
+static void h_av_replace(id s, SEL c, id item) {
+    ((void(*)(id, SEL, id))o_av_replace)(s, c, item);
+    if ([s isKindOfClass:[AVPlayer class]]) GSSampleAV(s);
+}
+static id h_av_initURL(id s, SEL c, id url) {
+    if ([url isKindOfClass:[NSURL class]]) {
+        NSString *us = [(NSURL *)url absoluteString];
+        GSRememberURL(us, @"AVPlayer");
+        if (!gInOurNetwork) GSFetchM3U8(us);
+    }
+    id r = ((id(*)(id, SEL, id))o_av_initURL)(s, c, url);
+    if ([r isKindOfClass:[AVPlayer class]]) GSSampleAV(r);
+    return r;
+}
+static id h_av_playerWithURL(id s, SEL c, id url) {
+    if ([url isKindOfClass:[NSURL class]]) {
+        NSString *us = [(NSURL *)url absoluteString];
+        GSRememberURL(us, @"AVPlayer");
+        if (!gInOurNetwork) GSFetchM3U8(us);
+    }
+    id r = ((id(*)(id, SEL, id))o_av_playerWithURL)(s, c, url);
+    if ([r isKindOfClass:[AVPlayer class]]) GSSampleAV(r);
+    return r;
+}
+static id h_item_initURL(id s, SEL c, id url) {
+    if ([url isKindOfClass:[NSURL class]]) {
+        NSString *us = [(NSURL *)url absoluteString];
+        GSRememberURL(us, @"AVItem");
+        if (!gInOurNetwork) GSFetchM3U8(us);
+    }
+    return ((id(*)(id, SEL, id))o_item_initURL)(s, c, url);
+}
+static id h_item_withURL(id s, SEL c, id url) {
+    if ([url isKindOfClass:[NSURL class]]) {
+        NSString *us = [(NSURL *)url absoluteString];
+        GSRememberURL(us, @"AVItem");
+        if (!gInOurNetwork) GSFetchM3U8(us);
+    }
+    return ((id(*)(id, SEL, id))o_item_withURL)(s, c, url);
+}
+static id h_asset_initURL(id s, SEL c, id url, id o) {
+    if ([url isKindOfClass:[NSURL class]]) {
+        NSString *us = [(NSURL *)url absoluteString];
+        GSRememberURL(us, @"AVURLAsset");
+        if (!gInOurNetwork) GSFetchM3U8(us);
+    }
+    id r = ((id(*)(id, SEL, id, id))o_asset_initURL)(s, c, url, o);
+    if ([r isKindOfClass:[AVAsset class]]) GSLoadAVMeta(r);
+    return r;
+}
+static id h_asset_withURL(id s, SEL c, id url, id o) {
+    if ([url isKindOfClass:[NSURL class]]) {
+        NSString *us = [(NSURL *)url absoluteString];
+// fix name - GSLoadAVMeta vs above
+static void GSLoadAVMeta(AVAsset *asset); // ensure
+
+// redefine properly - I used GSLoadAVMeta in hooks but defined GSLoadAVMeta - wait I defined GSLoadAVMeta as the function name in the AVMeta section... I named it GSLoadAVMeta in the second block - check
+
+// Actually I wrote `static void GSLoadAVMeta(AVAsset *asset)` - good.
+
+static id h_sess_req(id s, SEL c, id req) {
+    if (!gInOurNetwork && [req isKindOfClass:[NSURLRequest class]]) {
+        NSString *u = [(NSURLRequest *)req URL].absoluteString;
+        if (u.length) GSRememberURL(u, @"NET");
+    }
+    return ((id(*)(id, SEL, id))o_sess_req)(s, c, req);
+}
+static id h_sess_url(id s, SEL c, id url) {
+    if (!gInOurNetwork && [url isKindOfClass:[NSURL class]])
+        GSRememberURL([(NSURL *)url absoluteString], @"NET");
+    return ((id(*)(id, SEL, id))o_sess_url)(s, c, url);
+}
+
+static id h_json(id s, SEL c, id data, NSUInteger opt, NSError **err) {
+    id obj = ((id(*)(id, SEL, id, NSUInteger, NSError **))o_json)(s, c, data, opt, err);
+    if (obj) {
+        // 仅当已是容器：用 GSIngest 路径
+        @try {
+            NSData *raw = [NSJSONSerialization dataWithJSONObject:obj options:0 error:nil];
+            if (raw) {
+                NSString *txt = [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding];
+                if (txt) GSIngestPlaintextMaybeJSON(txt, GSTitleSrcJSON);
+            }
+        } @catch (__unused NSException *e) {
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{ GSRefreshPanelLabels(); });
+    }
+    return obj;
+}
+
+// flutter_des: handleMethodCall — 解密结果在 result 回调
+static void h_des_handle(id s, SEL c, id call, id result) {
+    NSString *method = nil;
+    id args = nil;
+    @try {
+        method = [call valueForKey:@"method"];
+        args = [call valueForKey:@"arguments"];
+    } @catch (__unused NSException *e) {
+    }
+
+    BOOL isDecrypt = method && ([method.lowercaseString containsString:@"decrypt"] ||
+                                [method isEqualToString:@"decrypt"] ||
+                                [method isEqualToString:@"decryptFromHex"]);
+
+    if (!isDecrypt || !result) {
+        ((void(*)(id, SEL, id, id))o_des_handle)(s, c, call, result);
+        return;
+    }
+
+    // 包装 result：拿到明文
+    void (^origResult)(id) = result;
+    void (^wrap)(id) = ^(id value) {
+      if ([value isKindOfClass:[NSString class]]) {
+          GSIngestPlaintextMaybeJSON((NSString *)value, GSTitleSrcDES);
+          dispatch_async(dispatch_get_main_queue(), ^{ GSRefreshPanelLabels(); });
+      } else if ([value isKindOfClass:[NSData class]]) {
+          NSString *txt = [[NSString alloc] initWithData:(NSData *)value encoding:NSUTF8StringEncoding];
+          if (txt) {
+              GSIngestPlaintextMaybeJSON(txt, GSTitleSrcDES);
+              dispatch_async(dispatch_get_main_queue(), ^{ GSRefreshPanelLabels(); });
+          }
+      } else if ([value isKindOfClass:[NSDictionary class]] || [value isKindOfClass:[NSArray class]]) {
+          @try {
+              NSData *raw = [NSJSONSerialization dataWithJSONObject:value options:0 error:nil];
+              NSString *txt = raw ? [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding] : nil;
+              if (txt) GSIngestPlaintextMaybeJSON(txt, GSTitleSrcDES);
+          } @catch (__unused NSException *e) {
+          }
+          dispatch_async(dispatch_get_main_queue(), ^{ GSRefreshPanelLabels(); });
+      }
+      if (origResult) origResult(value);
+    };
+    ((void(*)(id, SEL, id, id))o_des_handle)(s, c, call, wrap);
+}
