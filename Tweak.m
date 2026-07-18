@@ -1,11 +1,8 @@
 /*
- * GSPlayerInfo — 基于稳定备份 + 多源标题/手动选取
- * - 不去 hook NSURLSession completion（进播放器闪退主因）
- * - m3u8 抓取带 re-entry 保护
- * - 标题源：A11y / DES(flutter_des) / JSON / OCR / AVMeta / M3U8
- * - 默认自动优选；面板可手动点选某一来源
- * - 过滤 snake_case 技术串；无启动弹框
- * - 不使用 fishhook 强开 VoiceOver（避免启动崩溃）
+ * GSPlayerInfo
+ * - URL：AV/IJK/FVP 等稳定 hook（不 hook session completion）
+ * - 标题仅两源：Heap 堆扫（Frida 同算法，优先）+ OCR（兜底）
+ * - 面板可手动选 自动 / 堆扫 / OCR；无启动弹框
  */
 
 #import <UIKit/UIKit.h>
@@ -13,6 +10,7 @@
 #import <objc/message.h>
 #import <AVFoundation/AVFoundation.h>
 #import <Vision/Vision.h>
+#import "byg_title.h"
 
 static NSString *const kGSNASDownloadURL = @"http://192.168.6.110:38617/api/download";
 
@@ -24,23 +22,15 @@ static NSInteger gW = 0, gH = 0;
 static BOOL gHooksOK = NO;
 
 typedef NS_ENUM(NSInteger, GSTitleSrc) {
-    GSTitleSrcNone = 0, // 自动
-    GSTitleSrcA11y = 1,
-    GSTitleSrcDES = 2,
-    GSTitleSrcJSON = 3,
-    GSTitleSrcOCR = 4,
-    GSTitleSrcAVMeta = 5,
-    GSTitleSrcM3U8 = 6,
+    GSTitleSrcNone = 0, // 自动：Heap > OCR
+    GSTitleSrcHeap = 1,
+    GSTitleSrcOCR = 2,
 };
 
-static NSString *gTitleJSON = @"";
-static NSString *gTitleAVMeta = @"";
-static NSString *gTitleM3U8 = @"";
-static NSString *gTitleA11y = @"";
+static NSString *gTitleHeap = @"";
 static NSString *gTitleOCR = @"";
-static NSString *gTitleDES = @"";
 static NSString *gTitleBest = @"";
-static GSTitleSrc gTitlePick = GSTitleSrcNone; // 手动选用；None=自动
+static GSTitleSrc gTitlePick = GSTitleSrcNone;
 
 static UIButton *gBtn = nil;
 static UIView *gPanel = nil;
@@ -52,29 +42,30 @@ static AVPlayer *gLastAV = nil;
 static NSTimeInterval gLastOCR = 0;
 static NSTimeInterval gLastMeta = 0;
 static NSTimeInterval gLastM3U8Fetch = 0;
+static NSTimeInterval gLastHeapScan = 0;
 static NSString *gLastM3U8URL = @"";
-static NSString *gOCRBoundURL = @""; // 当前 OCR 结果对应的播放 URL
-static NSUInteger gPlayGen = 0;     // 换片代数，丢弃过期异步 OCR
+static NSString *gOCRBoundURL = @"";
+static NSString *gHeapBoundURL = @"";
+static NSUInteger gPlayGen = 0;
 static CGPoint gFabOffset = {0, 0};
 static BOOL gFabMoved = NO;
-static volatile BOOL gInOurNetwork = NO; // 防止我们自己的请求再进 hook 逻辑
-static BOOL gDesHooked = NO;
+static volatile BOOL gInOurNetwork = NO;
+static volatile BOOL gHeapScanning = NO;
 
-// 换片：清空各源标题，避免 OCR/A11y 等残留上一条
+// 换片：清空标题缓存
 static void GSResetTitlesForNewMedia(void) {
-    gTitleJSON = @"";
-    gTitleAVMeta = @"";
-    gTitleM3U8 = @"";
-    gTitleA11y = @"";
+    gTitleHeap = @"";
     gTitleOCR = @"";
-    gTitleDES = @"";
     gTitleBest = @"";
     gOCRBoundURL = @"";
+    gHeapBoundURL = @"";
     gLastOCR = 0;
     gLastMeta = 0;
     gLastM3U8Fetch = 0;
     gLastM3U8URL = @"";
+    gLastHeapScan = 0;
     gPlayGen++;
+    byg_clear_video_title_cache();
 }
 
 #pragma mark - String helpers
@@ -118,8 +109,8 @@ static BOOL GSLooksLikeTitle(NSString *t) {
     if (GSIsTechIdentifier(t)) return NO;
     NSArray *noise = @[
         @"关闭", @"复制", @"播放信息", @"分辨率", @"视频标题", @"视频URL", @"推送到", @"NAS", @"调试",
-        @"1.0X", @"全屏", @"倍速", @"i", @"AVPlayer", @"JSON", @"OCR", @"A11y", @"DES", @"Meta", @"M3U8",
-        @"未获取", @"等待", @"hooks", @"自动", @"选用", @"标题来源"
+        @"1.0X", @"全屏", @"倍速", @"i", @"AVPlayer", @"JSON", @"OCR", @"堆扫", @"未获取", @"等待",
+        @"hooks", @"自动", @"选用", @"标题来源"
     ];
     for (NSString *b in noise)
         if ([t isEqualToString:b]) return NO;
@@ -150,99 +141,105 @@ static BOOL GSLooksMediaURL(NSString *u) {
 
 static NSString *GSTitleOfSrc(GSTitleSrc src) {
     switch (src) {
-        case GSTitleSrcA11y: return gTitleA11y;
-        case GSTitleSrcDES: return gTitleDES;
-        case GSTitleSrcJSON: return gTitleJSON;
+        case GSTitleSrcHeap: return gTitleHeap;
         case GSTitleSrcOCR: return gTitleOCR;
-        case GSTitleSrcAVMeta: return gTitleAVMeta;
-        case GSTitleSrcM3U8: return gTitleM3U8;
         default: return @"";
     }
 }
 
 static NSString *GSSrcName(GSTitleSrc src) {
     switch (src) {
-        case GSTitleSrcA11y: return @"A11y";
-        case GSTitleSrcDES: return @"DES";
-        case GSTitleSrcJSON: return @"JSON";
+        case GSTitleSrcHeap: return @"堆扫";
         case GSTitleSrcOCR: return @"OCR";
-        case GSTitleSrcAVMeta: return @"AVMeta";
-        case GSTitleSrcM3U8: return @"M3U8";
         default: return @"自动";
     }
 }
 
-// 自动优先：A11y(画面上真标题) > DES(站点解密明文) > JSON > OCR > AVMeta > M3U8
+// 自动：堆扫优先，OCR 兜底
 static GSTitleSrc GSAutoPickSource(void) {
-    GSTitleSrc order[] = {
-        GSTitleSrcA11y, GSTitleSrcDES, GSTitleSrcJSON,
-        GSTitleSrcOCR, GSTitleSrcAVMeta, GSTitleSrcM3U8
-    };
-    for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
-        NSString *t = GSTitleOfSrc(order[i]);
-        if (GSLooksLikeTitle(t)) return order[i];
-    }
+    if (gTitleHeap.length >= 4)
+        return GSTitleSrcHeap;
+    if (GSLooksLikeTitle(gTitleOCR))
+        return GSTitleSrcOCR;
     return GSTitleSrcNone;
 }
 
 static void GSRecomputeBestTitle(void) {
     GSTitleSrc autoSrc = GSAutoPickSource();
-    gTitleBest = GSLooksLikeTitle(GSTitleOfSrc(autoSrc)) ? [GSTitleOfSrc(autoSrc) copy] : @"";
+    NSString *t = GSTitleOfSrc(autoSrc);
+    gTitleBest = t.length ? [t copy] : @"";
 }
 
-// 面板/复制/NAS 实际用的标题：手动优先，否则自动
 static NSString *GSEffectiveTitle(void) {
     if (gTitlePick != GSTitleSrcNone) {
         NSString *t = GSTitleOfSrc(gTitlePick);
-        if (t.length) return t; // 手动指定的即使略弱也展示，方便调试
+        if (t.length)
+            return t;
     }
     GSRecomputeBestTitle();
     return gTitleBest ?: @"";
 }
 
+static void GSRefreshPanelLabels(void); // 前置
+
+// 仅接受 Heap / OCR
 static void GSSetTitle(NSString *t, NSString *source) {
-    if (!GSLooksLikeTitle(t)) return;
+    if (!t.length)
+        return;
     t = [t stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if ([source isEqualToString:@"JSON"])
-        gTitleJSON = t;
-    else if ([source isEqualToString:@"A11y"])
-        gTitleA11y = t;
-    else if ([source isEqualToString:@"OCR"])
+    if ([source isEqualToString:@"Heap"]) {
+        if (t.length < 4)
+            return;
+        gTitleHeap = t;
+        gHeapBoundURL = [gURL copy] ?: @"";
+    } else if ([source isEqualToString:@"OCR"]) {
+        if (!GSLooksLikeTitle(t))
+            return;
         gTitleOCR = t;
-    else if ([source isEqualToString:@"AVMeta"])
-        gTitleAVMeta = t;
-    else if ([source isEqualToString:@"M3U8"])
-        gTitleM3U8 = t;
-    else if ([source isEqualToString:@"DES"])
-        gTitleDES = t;
+    } else {
+        return; // 其它旧来源全部忽略
+    }
     GSRecomputeBestTitle();
 }
 
-static void GSScanJSON(id o, int depth); // 前置声明
-
-// DES 解密明文：整段作标题 + 尝试当 JSON 再扫（标题同步进 DES 槽）
-static void GSIngestPlaintext(NSString *text, NSString *source) {
-    if (!text.length) return;
-    NSString *trim = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (trim.length >= 2 && trim.length < 200 && GSLooksLikeTitle(trim))
-        GSSetTitle(trim, source);
-    if (trim.length < 2) return;
-    BOOL maybeJSON = ([trim hasPrefix:@"{"] && [trim hasSuffix:@"}"]) ||
-                     ([trim hasPrefix:@"["] && [trim hasSuffix:@"]"]);
-    if (!maybeJSON) return;
-    @try {
-        NSData *d = [trim dataUsingEncoding:NSUTF8StringEncoding];
-        id obj = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
-        if (!obj) return;
-        NSString *beforeJSON = gTitleJSON ?: @"";
-        GSScanJSON(obj, 0);
-        if ([source isEqualToString:@"DES"] && gTitleJSON.length &&
-            ![gTitleJSON isEqualToString:beforeJSON] && GSLooksLikeTitle(gTitleJSON)) {
-            gTitleDES = [gTitleJSON copy];
-            GSRecomputeBestTitle();
-        }
-    } @catch (__unused NSException *e) {
+// 堆扫（后台）：与 get_title.py 同算法
+static void GSScanHeapTitle(BOOL force) {
+    NSTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (!force) {
+        if (gTitleHeap.length &&
+            (!gURL.length || !gHeapBoundURL.length || [gHeapBoundURL isEqualToString:gURL]))
+            return;
+        if (now - gLastHeapScan < 4.0)
+            return;
+    } else {
+        if (now - gLastHeapScan < 1.2)
+            return;
     }
+    if (gHeapScanning)
+        return;
+    gHeapScanning = YES;
+    gLastHeapScan = now;
+    NSUInteger gen = gPlayGen;
+    NSString *boundURL = [gURL copy] ?: @"";
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+      char *c = byg_copy_current_video_title_timeout(force ? 6000 : 4500);
+      NSString *title = nil;
+      if (c) {
+          title = [NSString stringWithUTF8String:c];
+          free(c);
+      }
+      dispatch_async(dispatch_get_main_queue(), ^{
+        gHeapScanning = NO;
+        if (gen != gPlayGen)
+            return;
+        if (boundURL.length && gURL.length && ![boundURL isEqualToString:gURL])
+            return;
+        if (title.length) {
+            GSSetTitle(title, @"Heap");
+            GSRefreshPanelLabels();
+        }
+      });
+    });
 }
 
 static void GSRememberURL(NSString *u, NSString *source) {
@@ -319,7 +316,7 @@ static void GSRefreshPanelLabels(void);
 static void GSLoadAVMetadataTitle(AVAsset *asset) {
     if (!asset) return;
     NSTimeInterval now = CFAbsoluteTimeGetCurrent();
-    if (now - gLastMeta < 2.0 && gTitleAVMeta.length) return;
+    if (now - gLastMeta < 2.0) return;
     gLastMeta = now;
 
     @try {
@@ -386,8 +383,8 @@ static void GSParseM3U8ForTitle(NSString *text) {
 
 static void GSFetchM3U8TitleIfNeeded(NSString *url) {
     if (!url.length || ![url.lowercaseString containsString:@"m3u8"]) return;
-    if ([gLastM3U8URL isEqualToString:url] && gTitleM3U8.length) return;
     NSTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if ([gLastM3U8URL isEqualToString:url] && now - gLastM3U8Fetch < 8.0) return;
     if (now - gLastM3U8Fetch < 3.0 && [gLastM3U8URL isEqualToString:url]) return;
     gLastM3U8Fetch = now;
     gLastM3U8URL = [url copy];
@@ -855,47 +852,6 @@ static id h_json(id s, SEL c, id data, NSUInteger opt, NSError **err) {
     return obj;
 }
 
-// flutter_des：只包 decrypt 的 result，拿到明文；非 decrypt 原样转发
-static IMP o_des_handle;
-static void h_des_handle(id s, SEL c, id call, id result) {
-    NSString *method = nil;
-    @try {
-        method = [call valueForKey:@"method"];
-    } @catch (__unused NSException *e) {
-    }
-    NSString *ml = method.lowercaseString ?: @"";
-    BOOL isDecrypt = [ml containsString:@"decrypt"];
-    if (!isDecrypt || !result) {
-        ((void (*)(id, SEL, id, id))o_des_handle)(s, c, call, result);
-        return;
-    }
-    void (^origResult)(id) = result;
-    void (^wrap)(id) = ^(id value) {
-        @try {
-            if ([value isKindOfClass:[NSString class]]) {
-                GSIngestPlaintext((NSString *)value, @"DES");
-            } else if ([value isKindOfClass:[NSData class]]) {
-                NSString *txt =
-                    [[NSString alloc] initWithData:(NSData *)value encoding:NSUTF8StringEncoding];
-                if (txt) GSIngestPlaintext(txt, @"DES");
-            } else if ([value isKindOfClass:[NSDictionary class]] ||
-                       [value isKindOfClass:[NSArray class]]) {
-                NSString *before = gTitleJSON ?: @"";
-                GSScanJSON(value, 0);
-                if (gTitleJSON.length && ![gTitleJSON isEqualToString:before] &&
-                    GSLooksLikeTitle(gTitleJSON)) {
-                    gTitleDES = [gTitleJSON copy];
-                    GSRecomputeBestTitle();
-                }
-            }
-        } @catch (__unused NSException *e) {
-        }
-        dispatch_async(dispatch_get_main_queue(), ^{ GSRefreshPanelLabels(); });
-        if (origResult) origResult(value);
-    };
-    ((void (*)(id, SEL, id, id))o_des_handle)(s, c, call, wrap);
-}
-
 static void GSInstallHooks(void) {
     Class ijk = NSClassFromString(@"IJKFFMoviePlayerController");
     if (ijk) {
@@ -942,24 +898,6 @@ static void GSInstallHooks(void) {
         }
     }
 
-    // flutter_des（存在才 hook；失败不影响启动）
-    if (!gDesHooked) {
-        Class desClasses[] = {
-            NSClassFromString(@"FlutterDesPlugin"),
-            NSClassFromString(@"SwiftFlutterDesPlugin"),
-            NSClassFromString(@"_TtC11flutter_des21SwiftFlutterDesPlugin"),
-        };
-        for (size_t i = 0; i < sizeof(desClasses) / sizeof(desClasses[0]); i++) {
-            Class des = desClasses[i];
-            if (!des) continue;
-            // 允许重复调用 GSSwizzleInst：其内部 *orig 已设则跳过
-            GSSwizzleInst(des, @selector(handleMethodCall:result:), (IMP)h_des_handle, &o_des_handle);
-            if (o_des_handle) {
-                gDesHooked = YES;
-                break;
-            }
-        }
-    }
 }
 
 #pragma mark - NAS
@@ -1044,17 +982,14 @@ static void GSRefreshPanelLabels(void) {
     if (gLabDebug) {
         gLabDebug.text = [NSString
             stringWithFormat:
-                @"调试·各方法标题（点上方按钮选用）:\n"
-                 "A11y: %@\n"
-                 "DES: %@\n"
-                 "JSON: %@\n"
+                @"调试·标题来源（堆扫=Frida同算法，优先）:\n"
+                 "堆扫: %@\n"
                  "OCR: %@\n"
-                 "AVMeta: %@\n"
-                 "M3U8: %@\n"
-                 "当前: %@ | hooks=%@ | des=%@",
-                GSDash(gTitleA11y), GSDash(gTitleDES), GSDash(gTitleJSON), GSDash(gTitleOCR),
-                GSDash(gTitleAVMeta), GSDash(gTitleM3U8), GSDash(eff), gHooksOK ? @"OK" : @"NO",
-                gDesHooked ? @"OK" : @"-"];
+                 "当前: %@\n"
+                 "hooks=%@ | heap=%@ | gen=%lu",
+                GSDash(gTitleHeap), GSDash(gTitleOCR), GSDash(eff), gHooksOK ? @"OK" : @"NO",
+                gHeapScanning ? @"扫中…" : (gTitleHeap.length ? @"OK" : @"-"),
+                (unsigned long)gPlayGen];
     }
     // 高亮：自动模式亮「自动」+ 当前命中源；手动模式只亮所选
     for (UIButton *b in gSrcBtns) {
@@ -1085,18 +1020,18 @@ static void GSShowPanel(void) {
     if (!win) return;
 
     @try {
-        GSScanA11yTitle();
         if (gLastAV) GSSampleAV(gLastAV);
         if (gLastIJK) GSSampleIJK(gLastIJK);
         if (gURL.length && !gInOurNetwork) GSFetchM3U8TitleIfNeeded(gURL);
-        // 每次开面板强制 OCR，避免一直显示上一条
+        // 首选堆扫；OCR 兜底
+        GSScanHeapTitle(YES);
         GSOcrTopTitle(YES);
     } @catch (__unused NSException *e) {
     }
 
     if (!gPanel) {
         CGFloat W = MIN(win.bounds.size.width - 28, 370);
-        CGFloat H = 500;
+        CGFloat H = 440;
         gPanel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, W, H)];
         gPanel.backgroundColor = [[UIColor colorWithWhite:0.1 alpha:1] colorWithAlphaComponent:0.96];
         gPanel.layer.cornerRadius = 14;
@@ -1132,24 +1067,21 @@ static void GSShowPanel(void) {
                                                     action:@selector(onCopyTitle)]];
         [gPanel addSubview:gLabTitle];
 
-        // 标题来源手动选取：自动 + 6 源
+        // 标题来源：自动(堆扫优先) / 堆扫 / OCR
         gSrcBtns = [NSMutableArray array];
-        NSArray *labels = @[ @"自动", @"A11y", @"DES", @"JSON", @"OCR", @"Meta", @"M3U8" ];
-        NSInteger tags[] = {99, GSTitleSrcA11y, GSTitleSrcDES, GSTitleSrcJSON,
-                            GSTitleSrcOCR, GSTitleSrcAVMeta, GSTitleSrcM3U8};
-        CGFloat bx = 12, by = 112, bh = 28, gap = 4;
-        CGFloat bw = (W - 24 - gap * 3) / 4.0;
+        NSArray *labels = @[ @"自动", @"堆扫", @"OCR" ];
+        NSInteger tags[] = {99, GSTitleSrcHeap, GSTitleSrcOCR};
+        CGFloat bx = 12, by = 112, bh = 30, gap = 6;
+        CGFloat bw = (W - 24 - gap * 2) / 3.0;
         for (NSInteger i = 0; i < (NSInteger)labels.count; i++) {
-            NSInteger col = i % 4;
-            NSInteger row = i / 4;
             UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-            b.frame = CGRectMake(bx + col * (bw + gap), by + row * (bh + gap), bw, bh);
+            b.frame = CGRectMake(bx + i * (bw + gap), by, bw, bh);
             b.tag = tags[i];
             b.layer.cornerRadius = 6;
             b.backgroundColor = [UIColor colorWithWhite:0.25 alpha:0.9];
             [b setTitle:labels[i] forState:UIControlStateNormal];
             [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-            b.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
+            b.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
             [b addTarget:[GSPlayerInfoTapTarget shared]
                           action:@selector(onPickSrc:)
                 forControlEvents:UIControlEventTouchUpInside];
@@ -1157,7 +1089,7 @@ static void GSShowPanel(void) {
             [gSrcBtns addObject:b];
         }
 
-        gLabURL = [[UILabel alloc] initWithFrame:CGRectMake(16, 180, W - 32, 48)];
+        gLabURL = [[UILabel alloc] initWithFrame:CGRectMake(16, 152, W - 32, 48)];
         gLabURL.textColor = [UIColor colorWithRed:0.55 green:1 blue:0.65 alpha:1];
         gLabURL.font = [UIFont systemFontOfSize:11];
         gLabURL.numberOfLines = 3;
@@ -1168,7 +1100,7 @@ static void GSShowPanel(void) {
         [gPanel addSubview:gLabURL];
 
         gBtnNas = [UIButton buttonWithType:UIButtonTypeCustom];
-        gBtnNas.frame = CGRectMake(16, 236, W - 32, 44);
+        gBtnNas.frame = CGRectMake(16, 208, W - 32, 44);
         gBtnNas.backgroundColor = [UIColor colorWithRed:0.2 green:0.55 blue:0.95 alpha:1];
         gBtnNas.layer.cornerRadius = 10;
         [gBtnNas setTitle:@"推送到 NAS 下载" forState:UIControlStateNormal];
@@ -1179,14 +1111,14 @@ static void GSShowPanel(void) {
             forControlEvents:UIControlEventTouchUpInside];
         [gPanel addSubview:gBtnNas];
 
-        UIView *dbgBox = [[UIView alloc] initWithFrame:CGRectMake(10, 290, W - 20, 196)];
+        UIView *dbgBox = [[UIView alloc] initWithFrame:CGRectMake(10, 264, W - 20, 160)];
         dbgBox.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.9];
         dbgBox.layer.cornerRadius = 8;
         dbgBox.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.12].CGColor;
         dbgBox.layer.borderWidth = 0.5;
         [gPanel addSubview:dbgBox];
 
-        gLabDebug = [[UILabel alloc] initWithFrame:CGRectMake(8, 6, W - 36, 184)];
+        gLabDebug = [[UILabel alloc] initWithFrame:CGRectMake(8, 6, W - 36, 148)];
         gLabDebug.textColor = [UIColor colorWithRed:1 green:0.88 blue:0.45 alpha:1];
         gLabDebug.font = [UIFont systemFontOfSize:10];
         gLabDebug.numberOfLines = 0;
@@ -1207,9 +1139,9 @@ static void GSShowPanel(void) {
     GSRefreshPanelLabels();
     [UIView animateWithDuration:0.2 animations:^{ gPanel.alpha = 1; }];
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-                     GSScanA11yTitle();
+                     GSScanHeapTitle(NO);
                      GSRefreshPanelLabels();
                    });
 }
@@ -1311,16 +1243,16 @@ static void GSEnsureFab(void) {
     GSHidePanel();
 }
 - (void)onCopyTitle {
-    GSScanA11yTitle();
+    GSScanHeapTitle(YES);
     GSOcrTopTitle(YES);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
                      NSString *t = GSEffectiveTitle();
                      if (t.length) {
                          UIPasteboard.generalPasteboard.string = t;
                          GSToast(@"已复制标题");
                      } else
-                         GSToast(@"暂无有效标题");
+                         GSToast(@"暂无有效标题（可稍后再点）");
                      GSRefreshPanelLabels();
                    });
 }
@@ -1340,13 +1272,17 @@ static void GSEnsureFab(void) {
         gTitlePick = GSTitleSrcNone;
     else
         gTitlePick = (GSTitleSrc)btn.tag;
+    if (gTitlePick == GSTitleSrcHeap || gTitlePick == GSTitleSrcNone)
+        GSScanHeapTitle(YES);
+    if (gTitlePick == GSTitleSrcOCR || gTitlePick == GSTitleSrcNone)
+        GSOcrTopTitle(gTitlePick == GSTitleSrcOCR);
     GSRefreshPanelLabels();
     NSString *name = GSSrcName(gTitlePick);
     NSString *val = GSEffectiveTitle();
     if (val.length)
         GSToast([NSString stringWithFormat:@"选用 %@：%@", name, GSDash(val)]);
     else
-        GSToast([NSString stringWithFormat:@"已选 %@（暂无值）", name]);
+        GSToast([NSString stringWithFormat:@"已选 %@（扫描中/暂无值）", name]);
 }
 - (void)onTick {
     @try {
@@ -1355,17 +1291,14 @@ static void GSEnsureFab(void) {
         if (gLastAV) GSSampleAV(gLastAV);
         if (gLastIJK) GSSampleIJK(gLastIJK);
         if (gURL.length || gLastAV || gLastIJK) {
-            GSScanA11yTitle();
-            // 后台仅在本片尚无 OCR 时补识别（换片后会清空）
-            GSOcrTopTitle(NO);
+            // 堆扫优先补标题；OCR 仅在无堆扫结果时补
+            GSScanHeapTitle(NO);
+            if (!gTitleHeap.length)
+                GSOcrTopTitle(NO);
             if (gURL.length && !gInOurNetwork) GSFetchM3U8TitleIfNeeded(gURL);
         }
-        // 清掉错误技术串
-        if (gTitleJSON.length && GSIsTechIdentifier(gTitleJSON)) gTitleJSON = @"";
-        if (gTitleA11y.length && GSIsTechIdentifier(gTitleA11y)) gTitleA11y = @"";
-        if (gTitleDES.length && GSIsTechIdentifier(gTitleDES)) gTitleDES = @"";
-        if (gTitleOCR.length && GSIsTechIdentifier(gTitleOCR)) gTitleOCR = @"";
-        if (gTitleBest.length && GSIsTechIdentifier(gTitleBest)) gTitleBest = @"";
+        if (gTitleOCR.length && GSIsTechIdentifier(gTitleOCR))
+            gTitleOCR = @"";
         GSRecomputeBestTitle();
         if (gPanel && !gPanel.hidden) GSRefreshPanelLabels();
     } @catch (__unused NSException *e) {
