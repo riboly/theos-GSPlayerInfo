@@ -171,10 +171,10 @@ static void GSRecomputeBestTitle(void) {
 }
 
 static NSString *GSEffectiveTitle(void) {
+    // 手动选用某一源时：绝不回退到另一源（堆扫空就显示空，别用 OCR 冒充）
     if (gTitlePick != GSTitleSrcNone) {
         NSString *t = GSTitleOfSrc(gTitlePick);
-        if (t.length)
-            return t;
+        return t.length ? t : @"";
     }
     GSRecomputeBestTitle();
     return gTitleBest ?: @"";
@@ -209,35 +209,55 @@ static void GSScanHeapTitle(BOOL force) {
         if (gTitleHeap.length &&
             (!gURL.length || !gHeapBoundURL.length || [gHeapBoundURL isEqualToString:gURL]))
             return;
-        if (now - gLastHeapScan < 4.0)
+        if (now - gLastHeapScan < 5.0)
             return;
     } else {
-        if (now - gLastHeapScan < 1.2)
+        if (gHeapScanning)
+            return; // 已在扫
+        if (now - gLastHeapScan < 0.8)
             return;
     }
     if (gHeapScanning)
         return;
     gHeapScanning = YES;
     gLastHeapScan = now;
+    if (force) {
+        // 强制扫时先清槽，面板立刻显示「未获取」而不是 OCR 冒充
+        gTitleHeap = @"";
+        gHeapBoundURL = @"";
+        GSRecomputeBestTitle();
+        GSRefreshPanelLabels();
+    }
     NSUInteger gen = gPlayGen;
     NSString *boundURL = [gURL copy] ?: @"";
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-      char *c = byg_copy_current_video_title_timeout(force ? 6000 : 4500);
+      char *c = NULL;
+      @try {
+          c = byg_copy_current_video_title_timeout(force ? 8000 : 5000);
+      } @catch (__unused NSException *e) {
+          c = NULL;
+      }
       NSString *title = nil;
       if (c) {
-          title = [NSString stringWithUTF8String:c];
+          title = [[NSString alloc] initWithUTF8String:c];
           free(c);
       }
+      const char *dbg = byg_last_scan_debug();
+      NSString *dbgStr = dbg ? [NSString stringWithUTF8String:dbg] : @"";
       dispatch_async(dispatch_get_main_queue(), ^{
         gHeapScanning = NO;
         if (gen != gPlayGen)
             return;
         if (boundURL.length && gURL.length && ![boundURL isEqualToString:gURL])
             return;
-        if (title.length) {
+        if (title.length >= 4) {
             GSSetTitle(title, @"Heap");
-            GSRefreshPanelLabels();
+            if (force)
+                GSToast([NSString stringWithFormat:@"堆扫OK %@", GSDash(title)]);
+        } else if (force) {
+            GSToast([NSString stringWithFormat:@"堆扫失败 %@", dbgStr.length ? dbgStr : @"无候选"]);
         }
+        GSRefreshPanelLabels();
       });
     });
 }
@@ -980,16 +1000,20 @@ static void GSRefreshPanelLabels(void) {
         gLabURL.text =
             [NSString stringWithFormat:@"URL：%@(点此复制)", gURL.length ? gURL : @"(未获取)"];
     if (gLabDebug) {
+        const char *hd = byg_last_scan_debug();
+        NSString *heapDbg = hd ? [NSString stringWithUTF8String:hd] : @"-";
         gLabDebug.text = [NSString
             stringWithFormat:
-                @"调试·标题来源（堆扫=Frida同算法，优先）:\n"
+                @"调试·标题（堆扫优先；手动堆扫不回退OCR）:\n"
                  "堆扫: %@\n"
                  "OCR: %@\n"
                  "当前: %@\n"
-                 "hooks=%@ | heap=%@ | gen=%lu",
-                GSDash(gTitleHeap), GSDash(gTitleOCR), GSDash(eff), gHooksOK ? @"OK" : @"NO",
-                gHeapScanning ? @"扫中…" : (gTitleHeap.length ? @"OK" : @"-"),
-                (unsigned long)gPlayGen];
+                 "hooks=%@ | heap=%@ | gen=%lu\n"
+                 "scan: %@",
+                GSDash(gTitleHeap), GSDash(gTitleOCR),
+                eff.length ? GSDash(eff) : @"(空)", gHooksOK ? @"OK" : @"NO",
+                gHeapScanning ? @"扫中…" : (gTitleHeap.length ? @"OK" : @"FAIL"),
+                (unsigned long)gPlayGen, heapDbg];
     }
     // 高亮：自动模式亮「自动」+ 当前命中源；手动模式只亮所选
     for (UIButton *b in gSrcBtns) {
@@ -1149,8 +1173,9 @@ static void GSShowPanel(void) {
 static void GSLayoutFab(void) {
     UIWindow *win = GSKeyWindow();
     if (!win || !gBtn) return;
-    CGFloat top = 72;
-    if (@available(iOS 11.0, *)) top = win.safeAreaInsets.top + 28;
+    // 默认再下移 20pt
+    CGFloat top = 92;
+    if (@available(iOS 11.0, *)) top = win.safeAreaInsets.top + 48;
     CGFloat side = 25;
     CGFloat x = win.bounds.size.width - side - 12 + gFabOffset.x;
     CGFloat y = top + gFabOffset.y;
