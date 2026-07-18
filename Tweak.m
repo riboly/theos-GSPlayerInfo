@@ -1,8 +1,8 @@
 /*
  * GSPlayerInfo
  * - URL：AV/IJK/FVP 等稳定 hook（不 hook session completion）
- * - 标题仅两源：Heap 堆扫（Frida 同算法，优先）+ OCR（兜底）
- * - 面板可手动选 自动 / 堆扫 / OCR；无启动弹框
+ * - 标题：仅 OCR 识别；面板内多行可编辑；复制/推 NAS 用当前编辑内容
+ * - 无启动弹框；悬浮钮可拖
  */
 
 #import <UIKit/UIKit.h>
@@ -10,7 +10,6 @@
 #import <objc/message.h>
 #import <AVFoundation/AVFoundation.h>
 #import <Vision/Vision.h>
-#import "byg_title.h"
 
 static NSString *const kGSNASDownloadURL = @"http://192.168.6.110:38617/api/download";
 
@@ -21,51 +20,43 @@ static NSString *gExtra = @"";
 static NSInteger gW = 0, gH = 0;
 static BOOL gHooksOK = NO;
 
-typedef NS_ENUM(NSInteger, GSTitleSrc) {
-    GSTitleSrcNone = 0, // 自动：Heap > OCR
-    GSTitleSrcHeap = 1,
-    GSTitleSrcOCR = 2,
-};
-
-static NSString *gTitleHeap = @"";
-static NSString *gTitleOCR = @"";
-static NSString *gTitleBest = @"";
-static GSTitleSrc gTitlePick = GSTitleSrcNone;
+// 标题：OCR 写入；用户编辑后 gTitleUserEdited=YES，换片前不再被 OCR 覆盖
+static NSString *gTitle = @"";
+static BOOL gTitleUserEdited = NO;
 
 static UIButton *gBtn = nil;
 static UIView *gPanel = nil;
-static UILabel *gLabRes = nil, *gLabTitle = nil, *gLabURL = nil, *gLabDebug = nil;
-static UIButton *gBtnNas = nil;
-static NSMutableArray<UIButton *> *gSrcBtns = nil;
+static UILabel *gLabRes = nil, *gLabTitleHint = nil, *gLabURL = nil, *gLabDebug = nil;
+static UITextView *gTitleEdit = nil;
+static UIButton *gBtnNas = nil, *gBtnCopyTitle = nil, *gBtnReOCR = nil;
 static id gLastIJK = nil;
 static AVPlayer *gLastAV = nil;
 static NSTimeInterval gLastOCR = 0;
 static NSTimeInterval gLastMeta = 0;
 static NSTimeInterval gLastM3U8Fetch = 0;
-static NSTimeInterval gLastHeapScan = 0;
 static NSString *gLastM3U8URL = @"";
 static NSString *gOCRBoundURL = @"";
-static NSString *gHeapBoundURL = @"";
 static NSUInteger gPlayGen = 0;
 static CGPoint gFabOffset = {0, 0};
 static BOOL gFabMoved = NO;
 static volatile BOOL gInOurNetwork = NO;
-static volatile BOOL gHeapScanning = NO;
 
-// 换片：清空标题缓存
+static void GSRefreshPanelLabels(void);
+static void GSToast(NSString *msg);
+static NSString *GSDash(NSString *s);
+
+// 换片：清空标题与编辑状态
 static void GSResetTitlesForNewMedia(void) {
-    gTitleHeap = @"";
-    gTitleOCR = @"";
-    gTitleBest = @"";
+    gTitle = @"";
+    gTitleUserEdited = NO;
     gOCRBoundURL = @"";
-    gHeapBoundURL = @"";
     gLastOCR = 0;
     gLastMeta = 0;
     gLastM3U8Fetch = 0;
     gLastM3U8URL = @"";
-    gLastHeapScan = 0;
     gPlayGen++;
-    byg_clear_video_title_cache();
+    if (gTitleEdit)
+        gTitleEdit.text = @"";
 }
 
 #pragma mark - String helpers
@@ -109,8 +100,8 @@ static BOOL GSLooksLikeTitle(NSString *t) {
     if (GSIsTechIdentifier(t)) return NO;
     NSArray *noise = @[
         @"关闭", @"复制", @"播放信息", @"分辨率", @"视频标题", @"视频URL", @"推送到", @"NAS", @"调试",
-        @"1.0X", @"全屏", @"倍速", @"i", @"AVPlayer", @"JSON", @"OCR", @"堆扫", @"未获取", @"等待",
-        @"hooks", @"自动", @"选用", @"标题来源"
+        @"1.0X", @"全屏", @"倍速", @"i", @"AVPlayer", @"JSON", @"OCR", @"未获取", @"等待", @"hooks",
+        @"重新识别", @"可编辑"
     ];
     for (NSString *b in noise)
         if ([t isEqualToString:b]) return NO;
@@ -139,129 +130,39 @@ static BOOL GSLooksMediaURL(NSString *u) {
            [l containsString:@"playlist"] || [l containsString:@".flv"];
 }
 
-static NSString *GSTitleOfSrc(GSTitleSrc src) {
-    switch (src) {
-        case GSTitleSrcHeap: return gTitleHeap;
-        case GSTitleSrcOCR: return gTitleOCR;
-        default: return @"";
-    }
+// 从编辑框同步到 gTitle（复制/推 NAS 前调用）
+static void GSSyncTitleFromEditor(void) {
+    if (!gTitleEdit)
+        return;
+    NSString *t = [gTitleEdit.text
+        stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    gTitle = t ?: @"";
 }
 
-static NSString *GSSrcName(GSTitleSrc src) {
-    switch (src) {
-        case GSTitleSrcHeap: return @"堆扫";
-        case GSTitleSrcOCR: return @"OCR";
-        default: return @"自动";
-    }
-}
-
-// 自动：堆扫优先，OCR 兜底
-static GSTitleSrc GSAutoPickSource(void) {
-    if (gTitleHeap.length >= 4)
-        return GSTitleSrcHeap;
-    if (GSLooksLikeTitle(gTitleOCR))
-        return GSTitleSrcOCR;
-    return GSTitleSrcNone;
-}
-
-static void GSRecomputeBestTitle(void) {
-    GSTitleSrc autoSrc = GSAutoPickSource();
-    NSString *t = GSTitleOfSrc(autoSrc);
-    gTitleBest = t.length ? [t copy] : @"";
-}
-
+// 面板/复制/NAS 使用的标题 = 编辑框当前内容（可手改）
 static NSString *GSEffectiveTitle(void) {
-    // 手动选用某一源时：绝不回退到另一源（堆扫空就显示空，别用 OCR 冒充）
-    if (gTitlePick != GSTitleSrcNone) {
-        NSString *t = GSTitleOfSrc(gTitlePick);
-        return t.length ? t : @"";
-    }
-    GSRecomputeBestTitle();
-    return gTitleBest ?: @"";
+    GSSyncTitleFromEditor();
+    return gTitle.length ? gTitle : @"";
 }
 
-static void GSRefreshPanelLabels(void); // 前置
-static void GSToast(NSString *msg);
-static NSString *GSDash(NSString *s);
-
-// 仅接受 Heap / OCR
-static void GSSetTitle(NSString *t, NSString *source) {
+// 仅 OCR 可写入；用户已手改则不覆盖（force 重新识别时调用方会清 gTitleUserEdited）
+static void GSSetTitleFromOCR(NSString *t) {
     if (!t.length)
         return;
     t = [t stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if ([source isEqualToString:@"Heap"]) {
-        if (t.length < 4)
-            return;
-        gTitleHeap = t;
-        gHeapBoundURL = [gURL copy] ?: @"";
-    } else if ([source isEqualToString:@"OCR"]) {
-        if (!GSLooksLikeTitle(t))
-            return;
-        gTitleOCR = t;
-    } else {
-        return; // 其它旧来源全部忽略
-    }
-    GSRecomputeBestTitle();
+    if (!GSLooksLikeTitle(t))
+        return;
+    if (gTitleUserEdited)
+        return;
+    gTitle = t;
+    if (gTitleEdit && !gTitleEdit.isFirstResponder)
+        gTitleEdit.text = t;
 }
 
-// 堆扫（后台）：与 get_title.py 同算法
-static void GSScanHeapTitle(BOOL force) {
-    NSTimeInterval now = CFAbsoluteTimeGetCurrent();
-    if (!force) {
-        if (gTitleHeap.length &&
-            (!gURL.length || !gHeapBoundURL.length || [gHeapBoundURL isEqualToString:gURL]))
-            return;
-        if (now - gLastHeapScan < 5.0)
-            return;
-    } else {
-        if (gHeapScanning)
-            return; // 已在扫
-        if (now - gLastHeapScan < 0.8)
-            return;
-    }
-    if (gHeapScanning)
-        return;
-    gHeapScanning = YES;
-    gLastHeapScan = now;
-    if (force) {
-        // 强制扫时先清槽，面板立刻显示「未获取」而不是 OCR 冒充
-        gTitleHeap = @"";
-        gHeapBoundURL = @"";
-        GSRecomputeBestTitle();
-        GSRefreshPanelLabels();
-    }
-    NSUInteger gen = gPlayGen;
-    NSString *boundURL = [gURL copy] ?: @"";
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-      char *c = NULL;
-      @try {
-          c = byg_copy_current_video_title_timeout(force ? 8000 : 5000);
-      } @catch (__unused NSException *e) {
-          c = NULL;
-      }
-      NSString *title = nil;
-      if (c) {
-          title = [[NSString alloc] initWithUTF8String:c];
-          free(c);
-      }
-      const char *dbg = byg_last_scan_debug();
-      NSString *dbgStr = dbg ? [NSString stringWithUTF8String:dbg] : @"";
-      dispatch_async(dispatch_get_main_queue(), ^{
-        gHeapScanning = NO;
-        if (gen != gPlayGen)
-            return;
-        if (boundURL.length && gURL.length && ![boundURL isEqualToString:gURL])
-            return;
-        if (title.length >= 4) {
-            GSSetTitle(title, @"Heap");
-            if (force)
-                GSToast([NSString stringWithFormat:@"堆扫OK %@", GSDash(title)]);
-        } else if (force) {
-            GSToast([NSString stringWithFormat:@"堆扫失败 %@", dbgStr.length ? dbgStr : @"无候选"]);
-        }
-        GSRefreshPanelLabels();
-      });
-    });
+// 兼容旧调用点：非 OCR 来源一律忽略（标题只靠 OCR + 手改）
+static void GSSetTitle(NSString *t, NSString *source) {
+    if ([source isEqualToString:@"OCR"])
+        GSSetTitleFromOCR(t);
 }
 
 static void GSRememberURL(NSString *u, NSString *source) {
@@ -553,29 +454,36 @@ static void GSScanA11yTitle(void) {
     }
 }
 
-// force=YES：打开面板/复制时强制重识别；force=NO：仅当前片尚无 OCR 时补一次
+// force=YES：打开面板/点「重新识别」；force=NO：本片尚无标题时后台补一次
+// 用户已手改标题时，非 force 不跑；force 由调用方先清 gTitleUserEdited
 static void GSOcrTopTitle(BOOL force) {
+    if (!force && gTitleUserEdited)
+        return;
     NSTimeInterval now = CFAbsoluteTimeGetCurrent();
     if (!force) {
-        // 本片已有 OCR 结果则跳过（换片会清 gTitleOCR / gOCRBoundURL）
-        if (gTitleOCR.length &&
+        if (gTitle.length &&
             (!gURL.length || !gOCRBoundURL.length || [gOCRBoundURL isEqualToString:gURL]))
             return;
-        if (now - gLastOCR < 2.5) return;
+        if (now - gLastOCR < 2.5)
+            return;
     } else {
-        // 强制也限流，避免连点 FAB 打爆 Vision
-        if (now - gLastOCR < 0.7) return;
-        // 先清空 OCR 槽，避免面板继续显示上一条/旧识别
-        gTitleOCR = @"";
-        gOCRBoundURL = @"";
-        GSRecomputeBestTitle();
+        if (now - gLastOCR < 0.7)
+            return;
+        if (!gTitleUserEdited) {
+            gTitle = @"";
+            gOCRBoundURL = @"";
+            if (gTitleEdit && !gTitleEdit.isFirstResponder)
+                gTitleEdit.text = @"";
+        }
     }
     gLastOCR = now;
     UIWindow *win = GSKeyWindow();
-    if (!win) return;
+    if (!win)
+        return;
     CGFloat scale = UIScreen.mainScreen.scale;
     CGFloat topInset = 0;
-    if (@available(iOS 11.0, *)) topInset = win.safeAreaInsets.top;
+    if (@available(iOS 11.0, *))
+        topInset = win.safeAreaInsets.top;
     CGRect band = CGRectMake(56, topInset, MAX(80, win.bounds.size.width - 120), 48);
     UIGraphicsBeginImageContextWithOptions(band.size, NO, scale);
     CGContextRef ctx = UIGraphicsGetCurrentContext();
@@ -584,35 +492,44 @@ static void GSOcrTopTitle(BOOL force) {
         return;
     }
     CGContextTranslateCTM(ctx, -band.origin.x, -band.origin.y);
-    // afterScreenUpdates:YES 尽量抓到当前片标题栏
     [win drawViewHierarchyInRect:win.bounds afterScreenUpdates:YES];
     UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
     UIGraphicsEndImageContext();
-    if (!img.CGImage) return;
+    if (!img.CGImage)
+        return;
 
     const NSUInteger gen = gPlayGen;
     NSString *boundURL = [gURL copy] ?: @"";
+    BOOL allowOverwrite = !gTitleUserEdited;
 
     VNImageRequestHandler *handler =
         [[VNImageRequestHandler alloc] initWithCGImage:img.CGImage options:@{}];
     VNRecognizeTextRequest *req =
         [[VNRecognizeTextRequest alloc] initWithCompletionHandler:^(VNRequest *request, NSError *error) {
-          if (error || !request.results.count) return;
+          if (error || !request.results.count)
+              return;
           NSString *best = nil;
           NSMutableString *join = [NSMutableString string];
           for (VNRecognizedTextObservation *obs in request.results) {
               NSString *s = [obs topCandidates:1].firstObject.string;
-              if (!s.length) continue;
+              if (!s.length)
+                  continue;
               [join appendString:s];
-              if (GSLooksLikeTitle(s) && (!best || s.length > best.length)) best = s;
+              if (GSLooksLikeTitle(s) && (!best || s.length > best.length))
+                  best = s;
           }
-          if ((!best || best.length < 4) && GSLooksLikeTitle(join)) best = join;
-          if (!best.length) return;
+          if ((!best || best.length < 4) && GSLooksLikeTitle(join))
+              best = join;
+          if (!best.length)
+              return;
           dispatch_async(dispatch_get_main_queue(), ^{
-            // 换片后丢弃过期 OCR 结果
-            if (gen != gPlayGen) return;
-            if (boundURL.length && gURL.length && ![boundURL isEqualToString:gURL]) return;
-            GSSetTitle(best, @"OCR");
+            if (gen != gPlayGen)
+                return;
+            if (boundURL.length && gURL.length && ![boundURL isEqualToString:gURL])
+                return;
+            if (!allowOverwrite && gTitleUserEdited)
+                return;
+            GSSetTitleFromOCR(best);
             gOCRBoundURL = boundURL.length ? [boundURL copy] : [gURL copy];
             GSRefreshPanelLabels();
           });
@@ -974,7 +891,7 @@ static void GSPushToNAS(void) {
 
 #pragma mark - Panel UI
 
-@interface GSPlayerInfoTapTarget : NSObject <UIGestureRecognizerDelegate>
+@interface GSPlayerInfoTapTarget : NSObject <UIGestureRecognizerDelegate, UITextViewDelegate>
 + (instancetype)shared;
 - (void)onFab;
 - (void)onTick;
@@ -982,60 +899,44 @@ static void GSPushToNAS(void) {
 - (void)onCopyTitle;
 - (void)onCopyURL;
 - (void)onPushNAS;
+- (void)onReOCR;
 - (void)onPan:(UIPanGestureRecognizer *)pan;
-- (void)onPickSrc:(UIButton *)btn;
 - (void)onIJKNote:(NSNotification *)n;
 @end
 
 static void GSRefreshPanelLabels(void) {
-    GSRecomputeBestTitle();
-    NSString *eff = GSEffectiveTitle();
-    GSTitleSrc autoSrc = GSAutoPickSource();
-    NSString *mode = (gTitlePick == GSTitleSrcNone)
-                         ? [NSString stringWithFormat:@"自动(%@)", GSSrcName(autoSrc)]
-                         : [NSString stringWithFormat:@"手动(%@)", GSSrcName(gTitlePick)];
-    if (gLabRes) gLabRes.text = [NSString stringWithFormat:@"分辨率：%@", GSResText()];
-    if (gLabTitle)
-        gLabTitle.text = [NSString stringWithFormat:@"标题[%@]：%@(点此复制)", mode,
-                                                    eff.length ? eff : @"(未获取)"];
+    // 正在编辑时不要用 gTitle 覆盖编辑框
+    BOOL editing = gTitleEdit && gTitleEdit.isFirstResponder;
+    if (!editing && gTitleEdit) {
+        if (![gTitleEdit.text isEqualToString:gTitle ?: @""])
+            gTitleEdit.text = gTitle.length ? gTitle : @"";
+    }
+    if (gLabRes)
+        gLabRes.text = [NSString stringWithFormat:@"分辨率：%@", GSResText()];
+    if (gLabTitleHint) {
+        gLabTitleHint.text = gTitleUserEdited
+                                 ? @"标题（已手改，可继续编辑）"
+                                 : @"标题（OCR，可多行编辑）";
+    }
     if (gLabURL)
         gLabURL.text =
             [NSString stringWithFormat:@"URL：%@(点此复制)", gURL.length ? gURL : @"(未获取)"];
     if (gLabDebug) {
-        const char *hd = byg_last_scan_debug();
-        NSString *heapDbg = hd ? [NSString stringWithUTF8String:hd] : @"-";
         gLabDebug.text = [NSString
-            stringWithFormat:
-                @"调试·标题（堆扫优先；手动堆扫不回退OCR）:\n"
-                 "堆扫: %@\n"
-                 "OCR: %@\n"
-                 "当前: %@\n"
-                 "hooks=%@ | heap=%@ | gen=%lu\n"
-                 "scan: %@",
-                GSDash(gTitleHeap), GSDash(gTitleOCR),
-                eff.length ? GSDash(eff) : @"(空)", gHooksOK ? @"OK" : @"NO",
-                gHeapScanning ? @"扫中…" : (gTitleHeap.length ? @"OK" : @"FAIL"),
-                (unsigned long)gPlayGen, heapDbg];
-    }
-    // 高亮：自动模式亮「自动」+ 当前命中源；手动模式只亮所选
-    for (UIButton *b in gSrcBtns) {
-        BOOL isAuto = (b.tag == 99);
-        BOOL on = NO;
-        if (isAuto)
-            on = (gTitlePick == GSTitleSrcNone);
-        else if (gTitlePick != GSTitleSrcNone)
-            on = (b.tag == (NSInteger)gTitlePick);
-        else
-            on = (b.tag == (NSInteger)autoSrc);
-        b.backgroundColor = on ? [UIColor colorWithRed:0.25 green:0.55 blue:0.95 alpha:0.95]
-                               : [UIColor colorWithWhite:0.25 alpha:0.9];
+            stringWithFormat:@"调试: hooks=%@ | OCR=%@ | 手改=%@ | gen=%lu\n标题: %@",
+                             gHooksOK ? @"OK" : @"NO", gTitle.length ? GSDash(gTitle) : @"-",
+                             gTitleUserEdited ? @"是" : @"否", (unsigned long)gPlayGen,
+                             gTitle.length ? gTitle : @"(空)"];
     }
     gBtnNas.enabled = gURL.length > 0;
     gBtnNas.alpha = gURL.length ? 1 : 0.45;
 }
 
 static void GSHidePanel(void) {
-    if (!gPanel) return;
+    if (!gPanel)
+        return;
+    GSSyncTitleFromEditor();
+    [gTitleEdit resignFirstResponder];
     [UIView animateWithDuration:0.2
         animations:^{ gPanel.alpha = 0; }
         completion:^(BOOL f) { gPanel.hidden = YES; }];
@@ -1043,21 +944,27 @@ static void GSHidePanel(void) {
 
 static void GSShowPanel(void) {
     UIWindow *win = GSKeyWindow();
-    if (!win) return;
+    if (!win)
+        return;
 
     @try {
-        if (gLastAV) GSSampleAV(gLastAV);
-        if (gLastIJK) GSSampleIJK(gLastIJK);
-        if (gURL.length && !gInOurNetwork) GSFetchM3U8TitleIfNeeded(gURL);
-        // 首选堆扫；OCR 兜底
-        GSScanHeapTitle(YES);
-        GSOcrTopTitle(YES);
+        if (gLastAV)
+            GSSampleAV(gLastAV);
+        if (gLastIJK)
+            GSSampleIJK(gLastIJK);
+        if (gURL.length && !gInOurNetwork)
+            GSFetchM3U8TitleIfNeeded(gURL);
+        // 仅 OCR；已手改则不覆盖
+        if (!gTitleUserEdited)
+            GSOcrTopTitle(YES);
+        else if (!gTitle.length)
+            GSOcrTopTitle(YES);
     } @catch (__unused NSException *e) {
     }
 
     if (!gPanel) {
         CGFloat W = MIN(win.bounds.size.width - 28, 370);
-        CGFloat H = 440;
+        CGFloat H = 460;
         gPanel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, W, H)];
         gPanel.backgroundColor = [[UIColor colorWithWhite:0.1 alpha:1] colorWithAlphaComponent:0.96];
         gPanel.layer.cornerRadius = 14;
@@ -1078,44 +985,59 @@ static void GSShowPanel(void) {
             forControlEvents:UIControlEventTouchUpInside];
         [gPanel addSubview:close];
 
-        gLabRes = [[UILabel alloc] initWithFrame:CGRectMake(16, 44, W - 32, 18)];
+        gLabRes = [[UILabel alloc] initWithFrame:CGRectMake(16, 42, W - 32, 18)];
         gLabRes.textColor = [UIColor colorWithWhite:0.92 alpha:1];
         gLabRes.font = [UIFont systemFontOfSize:13];
         [gPanel addSubview:gLabRes];
 
-        gLabTitle = [[UILabel alloc] initWithFrame:CGRectMake(16, 64, W - 32, 44)];
-        gLabTitle.textColor = [UIColor colorWithRed:0.6 green:0.9 blue:1 alpha:1];
-        gLabTitle.font = [UIFont systemFontOfSize:12];
-        gLabTitle.numberOfLines = 3;
-        gLabTitle.userInteractionEnabled = YES;
-        [gLabTitle addGestureRecognizer:[[UITapGestureRecognizer alloc]
-                                            initWithTarget:[GSPlayerInfoTapTarget shared]
-                                                    action:@selector(onCopyTitle)]];
-        [gPanel addSubview:gLabTitle];
+        gLabTitleHint = [[UILabel alloc] initWithFrame:CGRectMake(16, 64, W - 32, 16)];
+        gLabTitleHint.text = @"标题（OCR，可多行编辑）";
+        gLabTitleHint.textColor = [UIColor colorWithWhite:0.75 alpha:1];
+        gLabTitleHint.font = [UIFont systemFontOfSize:11];
+        [gPanel addSubview:gLabTitleHint];
 
-        // 标题来源：自动(堆扫优先) / 堆扫 / OCR
-        gSrcBtns = [NSMutableArray array];
-        NSArray *labels = @[ @"自动", @"堆扫", @"OCR" ];
-        NSInteger tags[] = {99, GSTitleSrcHeap, GSTitleSrcOCR};
-        CGFloat bx = 12, by = 112, bh = 30, gap = 6;
-        CGFloat bw = (W - 24 - gap * 2) / 3.0;
-        for (NSInteger i = 0; i < (NSInteger)labels.count; i++) {
-            UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-            b.frame = CGRectMake(bx + i * (bw + gap), by, bw, bh);
-            b.tag = tags[i];
-            b.layer.cornerRadius = 6;
-            b.backgroundColor = [UIColor colorWithWhite:0.25 alpha:0.9];
-            [b setTitle:labels[i] forState:UIControlStateNormal];
-            [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-            b.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
-            [b addTarget:[GSPlayerInfoTapTarget shared]
-                          action:@selector(onPickSrc:)
+        gTitleEdit = [[UITextView alloc] initWithFrame:CGRectMake(12, 84, W - 24, 88)];
+        gTitleEdit.backgroundColor = [UIColor colorWithWhite:0.16 alpha:1];
+        gTitleEdit.textColor = [UIColor colorWithRed:0.65 green:0.92 blue:1 alpha:1];
+        gTitleEdit.font = [UIFont systemFontOfSize:14];
+        gTitleEdit.layer.cornerRadius = 8;
+        gTitleEdit.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.15].CGColor;
+        gTitleEdit.layer.borderWidth = 0.5;
+        gTitleEdit.textContainerInset = UIEdgeInsetsMake(8, 6, 8, 6);
+        gTitleEdit.editable = YES;
+        gTitleEdit.scrollEnabled = YES;
+        gTitleEdit.delegate = [GSPlayerInfoTapTarget shared];
+        gTitleEdit.keyboardAppearance = UIKeyboardAppearanceDark;
+        gTitleEdit.returnKeyType = UIReturnKeyDefault;
+        gTitleEdit.text = gTitle.length ? gTitle : @"";
+        [gPanel addSubview:gTitleEdit];
+
+        CGFloat btnW = (W - 32 - 8) / 2.0;
+        gBtnCopyTitle = [UIButton buttonWithType:UIButtonTypeCustom];
+        gBtnCopyTitle.frame = CGRectMake(16, 180, btnW, 34);
+        gBtnCopyTitle.backgroundColor = [UIColor colorWithWhite:0.28 alpha:1];
+        gBtnCopyTitle.layer.cornerRadius = 8;
+        [gBtnCopyTitle setTitle:@"复制标题" forState:UIControlStateNormal];
+        [gBtnCopyTitle setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        gBtnCopyTitle.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+        [gBtnCopyTitle addTarget:[GSPlayerInfoTapTarget shared]
+                          action:@selector(onCopyTitle)
                 forControlEvents:UIControlEventTouchUpInside];
-            [gPanel addSubview:b];
-            [gSrcBtns addObject:b];
-        }
+        [gPanel addSubview:gBtnCopyTitle];
 
-        gLabURL = [[UILabel alloc] initWithFrame:CGRectMake(16, 152, W - 32, 48)];
+        gBtnReOCR = [UIButton buttonWithType:UIButtonTypeCustom];
+        gBtnReOCR.frame = CGRectMake(16 + btnW + 8, 180, btnW, 34);
+        gBtnReOCR.backgroundColor = [UIColor colorWithWhite:0.28 alpha:1];
+        gBtnReOCR.layer.cornerRadius = 8;
+        [gBtnReOCR setTitle:@"重新OCR" forState:UIControlStateNormal];
+        [gBtnReOCR setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        gBtnReOCR.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+        [gBtnReOCR addTarget:[GSPlayerInfoTapTarget shared]
+                      action:@selector(onReOCR)
+            forControlEvents:UIControlEventTouchUpInside];
+        [gPanel addSubview:gBtnReOCR];
+
+        gLabURL = [[UILabel alloc] initWithFrame:CGRectMake(16, 224, W - 32, 48)];
         gLabURL.textColor = [UIColor colorWithRed:0.55 green:1 blue:0.65 alpha:1];
         gLabURL.font = [UIFont systemFontOfSize:11];
         gLabURL.numberOfLines = 3;
@@ -1126,7 +1048,7 @@ static void GSShowPanel(void) {
         [gPanel addSubview:gLabURL];
 
         gBtnNas = [UIButton buttonWithType:UIButtonTypeCustom];
-        gBtnNas.frame = CGRectMake(16, 208, W - 32, 44);
+        gBtnNas.frame = CGRectMake(16, 280, W - 32, 44);
         gBtnNas.backgroundColor = [UIColor colorWithRed:0.2 green:0.55 blue:0.95 alpha:1];
         gBtnNas.layer.cornerRadius = 10;
         [gBtnNas setTitle:@"推送到 NAS 下载" forState:UIControlStateNormal];
@@ -1137,14 +1059,14 @@ static void GSShowPanel(void) {
             forControlEvents:UIControlEventTouchUpInside];
         [gPanel addSubview:gBtnNas];
 
-        UIView *dbgBox = [[UIView alloc] initWithFrame:CGRectMake(10, 264, W - 20, 160)];
+        UIView *dbgBox = [[UIView alloc] initWithFrame:CGRectMake(10, 336, W - 20, 110)];
         dbgBox.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.9];
         dbgBox.layer.cornerRadius = 8;
         dbgBox.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.12].CGColor;
         dbgBox.layer.borderWidth = 0.5;
         [gPanel addSubview:dbgBox];
 
-        gLabDebug = [[UILabel alloc] initWithFrame:CGRectMake(8, 6, W - 36, 148)];
+        gLabDebug = [[UILabel alloc] initWithFrame:CGRectMake(8, 6, W - 36, 98)];
         gLabDebug.textColor = [UIColor colorWithRed:1 green:0.88 blue:0.45 alpha:1];
         gLabDebug.font = [UIFont systemFontOfSize:10];
         gLabDebug.numberOfLines = 0;
@@ -1167,7 +1089,8 @@ static void GSShowPanel(void) {
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-                     GSScanHeapTitle(NO);
+                     if (!gTitleUserEdited)
+                         GSOcrTopTitle(NO);
                      GSRefreshPanelLabels();
                    });
 }
@@ -1270,18 +1193,13 @@ static void GSEnsureFab(void) {
     GSHidePanel();
 }
 - (void)onCopyTitle {
-    GSScanHeapTitle(YES);
-    GSOcrTopTitle(YES);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-                     NSString *t = GSEffectiveTitle();
-                     if (t.length) {
-                         UIPasteboard.generalPasteboard.string = t;
-                         GSToast(@"已复制标题");
-                     } else
-                         GSToast(@"暂无有效标题（可稍后再点）");
-                     GSRefreshPanelLabels();
-                   });
+    NSString *t = GSEffectiveTitle();
+    if (t.length) {
+        UIPasteboard.generalPasteboard.string = t;
+        GSToast(@"已复制标题");
+    } else {
+        GSToast(@"暂无标题（可手输或点重新OCR）");
+    }
 }
 - (void)onCopyURL {
     if (!gURL.length) {
@@ -1292,42 +1210,52 @@ static void GSEnsureFab(void) {
     GSToast(@"已复制URL");
 }
 - (void)onPushNAS {
+    GSSyncTitleFromEditor();
     GSPushToNAS();
 }
-- (void)onPickSrc:(UIButton *)btn {
-    if (btn.tag == 99)
-        gTitlePick = GSTitleSrcNone;
-    else
-        gTitlePick = (GSTitleSrc)btn.tag;
-    if (gTitlePick == GSTitleSrcHeap || gTitlePick == GSTitleSrcNone)
-        GSScanHeapTitle(YES);
-    if (gTitlePick == GSTitleSrcOCR || gTitlePick == GSTitleSrcNone)
-        GSOcrTopTitle(gTitlePick == GSTitleSrcOCR);
+- (void)onReOCR {
+    // 重新识别：允许覆盖手改
+    gTitleUserEdited = NO;
+    gTitle = @"";
+    gOCRBoundURL = @"";
+    if (gTitleEdit)
+        gTitleEdit.text = @"";
     GSRefreshPanelLabels();
-    NSString *name = GSSrcName(gTitlePick);
-    NSString *val = GSEffectiveTitle();
-    if (val.length)
-        GSToast([NSString stringWithFormat:@"选用 %@：%@", name, GSDash(val)]);
-    else
-        GSToast([NSString stringWithFormat:@"已选 %@（扫描中/暂无值）", name]);
+    GSOcrTopTitle(YES);
+    GSToast(@"正在 OCR…");
+}
+- (void)textViewDidChange:(UITextView *)textView {
+    if (textView != gTitleEdit)
+        return;
+    gTitleUserEdited = YES;
+    GSSyncTitleFromEditor();
+    if (gLabTitleHint)
+        gLabTitleHint.text = @"标题（已手改，可继续编辑）";
+}
+- (void)textViewDidEndEditing:(UITextView *)textView {
+    if (textView != gTitleEdit)
+        return;
+    GSSyncTitleFromEditor();
+    GSRefreshPanelLabels();
 }
 - (void)onTick {
     @try {
         GSInstallHooks();
         GSEnsureFab();
-        if (gLastAV) GSSampleAV(gLastAV);
-        if (gLastIJK) GSSampleIJK(gLastIJK);
+        if (gLastAV)
+            GSSampleAV(gLastAV);
+        if (gLastIJK)
+            GSSampleIJK(gLastIJK);
         if (gURL.length || gLastAV || gLastIJK) {
-            // 堆扫优先补标题；OCR 仅在无堆扫结果时补
-            GSScanHeapTitle(NO);
-            if (!gTitleHeap.length)
+            if (!gTitleUserEdited)
                 GSOcrTopTitle(NO);
-            if (gURL.length && !gInOurNetwork) GSFetchM3U8TitleIfNeeded(gURL);
+            if (gURL.length && !gInOurNetwork)
+                GSFetchM3U8TitleIfNeeded(gURL);
         }
-        if (gTitleOCR.length && GSIsTechIdentifier(gTitleOCR))
-            gTitleOCR = @"";
-        GSRecomputeBestTitle();
-        if (gPanel && !gPanel.hidden) GSRefreshPanelLabels();
+        if (gTitle.length && GSIsTechIdentifier(gTitle) && !gTitleUserEdited)
+            gTitle = @"";
+        if (gPanel && !gPanel.hidden)
+            GSRefreshPanelLabels();
     } @catch (__unused NSException *e) {
     }
 }
