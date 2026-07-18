@@ -181,6 +181,8 @@ static NSString *GSEffectiveTitle(void) {
 }
 
 static void GSRefreshPanelLabels(void); // 前置
+static void GSToast(NSString *msg);
+static NSString *GSDash(NSString *s);
 
 // 仅接受 Heap / OCR
 static void GSSetTitle(NSString *t, NSString *source) {
